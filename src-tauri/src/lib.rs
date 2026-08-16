@@ -2,6 +2,7 @@ mod collectors;
 pub mod domain;
 mod history;
 mod identity;
+pub mod opencode_history;
 pub mod storage;
 
 pub const APP_IDENTIFIER: &str = "com.huntsman.vibebar";
@@ -14,7 +15,7 @@ use std::{
 use chrono::{Duration, Utc};
 use domain::{
     DashboardSnapshot, RecentEvent, UsageEvent, UsageHistory, aggregate_agent_usage,
-    aggregate_workflow, merge_agent_usage,
+    aggregate_workflow,
 };
 use tauri::{
     Manager, State,
@@ -90,8 +91,10 @@ fn build_snapshot(data_dir: &std::path::Path) -> DashboardSnapshot {
         })
         .collect();
     let event_agent_usage = aggregate_agent_usage(&events, now - Duration::days(30));
-    let agent_usage = match collectors::collect_opencode_agent_usage() {
-        Ok(opencode_usage) => merge_agent_usage(opencode_usage, event_agent_usage),
+    let agent_usage = match opencode_history::collect_opencode_agents() {
+        Ok(opencode_usage) => {
+            opencode_history::merge_agent_usage_sources(opencode_usage, event_agent_usage)
+        }
         Err(error) => {
             diagnostics.push(error);
             event_agent_usage
