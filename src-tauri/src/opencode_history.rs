@@ -259,18 +259,28 @@ pub fn merge_agent_usage_sources(
     for item in primary.iter_mut().chain(fallback.iter_mut()) {
         item.provider = normalize_provider_id(&item.provider);
     }
-    let owned_providers = primary
+    let owned_keys = primary
         .iter()
-        .map(|item| item.provider.clone())
+        .map(agent_ownership_key)
         .collect::<HashSet<_>>();
     let mut merged = primary;
     merged.extend(
         fallback
             .into_iter()
-            .filter(|item| !owned_providers.contains(&item.provider)),
+            .filter(|item| !owned_keys.contains(&agent_ownership_key(item))),
     );
     sort_agent_usage(&mut merged);
     merged
+}
+
+type AgentOwnershipKey = (String, String, String);
+
+fn agent_ownership_key(item: &AgentUsage) -> AgentOwnershipKey {
+    (
+        item.agent.clone(),
+        normalize_provider_id(&item.provider),
+        item.model.clone(),
+    )
 }
 
 fn history_from_grouped_rows(grouped: BTreeMap<HistoryKey, HistoryAccumulator>) -> UsageHistory {
@@ -1746,7 +1756,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_deduplicates_event_rows_by_provider_ownership() {
+    fn merge_deduplicates_event_rows_by_agent_provider_model_ownership() {
         let primary = vec![
             AgentUsage {
                 agent: "executor".into(),
@@ -1780,6 +1790,21 @@ mod tests {
             },
         ];
         let fallback = vec![
+            AgentUsage {
+                agent: "executor".into(),
+                provider: " NaN ".into(),
+                model: "qwen3.6".into(),
+                source: "vibebar-events-30d".into(),
+                calls: 99,
+                tasks: 99,
+                tokens: TokenUsage {
+                    input_tokens: 9_900,
+                    output_tokens: 990,
+                    reasoning_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+            },
             AgentUsage {
                 agent: "reviewer".into(),
                 provider: "nan".into(),
@@ -1843,19 +1868,27 @@ mod tests {
         ];
 
         let merged = merge_agent_usage_sources(primary, fallback);
-        assert_eq!(merged.len(), 4);
+        assert_eq!(merged.len(), 6);
         assert!(merged.iter().any(|item| item.provider == "chatgpt"));
         assert!(merged.iter().any(|item| item.provider == "opencode-go"));
-        assert!(
-            !merged
-                .iter()
-                .any(|item| item.provider == "nan" && item.source == "vibebar-events-30d")
-        );
-        assert!(
-            !merged
-                .iter()
-                .any(|item| item.provider == "custom-provider"
-                    && item.source == "vibebar-events-30d")
-        );
+        assert!(merged.iter().any(|item| {
+            item.agent == "reviewer"
+                && item.provider == "nan"
+                && item.model == "deepseek-v4-flash"
+                && item.source == "vibebar-events-30d"
+        }));
+        assert!(merged.iter().any(|item| {
+            item.agent == "auditor"
+                && item.provider == "custom-provider"
+                && item.model == "glm5.2"
+                && item.source == "vibebar-events-30d"
+        }));
+        let primary_nan = merged
+            .iter()
+            .find(|item| item.agent == "executor" && item.provider == "nan")
+            .unwrap();
+        assert_eq!(primary_nan.model, "qwen3.6");
+        assert_eq!(primary_nan.calls, 3);
+        assert_eq!(primary_nan.source, MESSAGE_SOURCE);
     }
 }

@@ -101,10 +101,10 @@ fn merge_history_sources(
     events: &[UsageEvent],
     since: DateTime<Utc>,
 ) -> UsageHistory {
-    let owned_providers = primary
+    let owned_history_keys = primary
         .rows
         .iter()
-        .map(|row| normalize_provider_id(&row.provider))
+        .map(history_ownership_key)
         .collect::<std::collections::HashSet<_>>();
     let event_history = provider_history_from_events(events, since);
     let mut merged = aggregate_history_rows(
@@ -112,7 +112,7 @@ fn merge_history_sources(
             event_history
                 .rows
                 .into_iter()
-                .filter(|row| !owned_providers.contains(&normalize_provider_id(&row.provider))),
+                .filter(|row| !owned_history_keys.contains(&history_ownership_key(row))),
         ),
     );
     merged.truncated = primary.truncated || event_history.truncated || merged.truncated;
@@ -121,6 +121,18 @@ fn merge_history_sources(
         || merged.repository_attribution_enabled;
     merged.available = primary.available || event_history.available || merged.available;
     merged
+}
+
+type HistoryOwnershipKey = (String, String, String, String, String);
+
+fn history_ownership_key(row: &UsageHistoryRow) -> HistoryOwnershipKey {
+    (
+        row.day.clone(),
+        row.repository.clone(),
+        row.agent.clone(),
+        normalize_provider_id(&row.provider),
+        row.model.clone(),
+    )
 }
 
 fn reconcile_provider_cards_with_history(
@@ -133,17 +145,12 @@ fn reconcile_provider_cards_with_history(
         .map(|provider| normalize_provider_id(&provider.id))
         .collect::<BTreeSet<_>>();
     let mut grouped: BTreeMap<String, BTreeMap<String, (u64, TokenUsage)>> = BTreeMap::new();
-    let mut sources: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for row in &history.rows {
         let provider_id = normalize_provider_id(&row.provider);
-        if existing_ids.contains(&provider_id) && row.source_fidelity == "event-fallback" {
+        if existing_ids.contains(&provider_id) {
             continue;
         }
-        sources
-            .entry(provider_id.clone())
-            .or_default()
-            .insert(row.source.clone());
         let entry = grouped
             .entry(provider_id)
             .or_default()
@@ -181,72 +188,19 @@ fn reconcile_provider_cards_with_history(
     }
 
     let updated_at = now.to_rfc3339();
-    for provider in &mut providers {
-        let provider_id = normalize_provider_id(&provider.id);
-        let Some(history_models) = grouped.remove(&provider_id) else {
-            continue;
-        };
-        let existing_models = provider
-            .models
-            .iter()
-            .map(|model| (model.model.clone(), model.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let mut models = history_models
+    for (provider_id, models) in grouped {
+        let mut models = models
             .into_iter()
             .map(|(model, (calls, tokens))| {
-                let existing = existing_models.get(&model);
-                let recalculated_quotas =
-                    collectors::quota_windows_for(&provider_id, &model, tokens.billable());
+                let quota_windows = collectors::allowance_windows_for(&provider_id, &model);
                 ModelUsage {
                     model,
                     calls,
                     tokens,
-                    quota_tokens: existing.and_then(|item| item.quota_tokens),
-                    quota_label: existing.and_then(|item| item.quota_label.clone()),
-                    quota_windows: if recalculated_quotas.is_empty() {
-                        existing
-                            .map(|item| item.quota_windows.clone())
-                            .unwrap_or_default()
-                    } else {
-                        recalculated_quotas
-                    },
+                    quota_tokens: None,
+                    quota_label: None,
+                    quota_windows,
                 }
-            })
-            .collect::<Vec<_>>();
-        models.sort_by(|left, right| {
-            right
-                .tokens
-                .billable()
-                .cmp(&left.tokens.billable())
-                .then_with(|| right.calls.cmp(&left.calls))
-                .then_with(|| left.model.cmp(&right.model))
-        });
-        provider.calls = models.iter().map(|model| model.calls).sum();
-        provider.tokens = sum_model_tokens(&models);
-        provider.models = models;
-        provider.source = sources
-            .get(&provider_id)
-            .and_then(|items| {
-                (items.len() == 1)
-                    .then(|| items.iter().next().cloned())
-                    .flatten()
-            })
-            .unwrap_or_else(|| "usage-history-31d".into());
-        provider.status = "ok".into();
-        provider.error = None;
-        provider.updated_at = updated_at.clone();
-    }
-
-    for (provider_id, models) in grouped {
-        let mut models = models
-            .into_iter()
-            .map(|(model, (calls, tokens))| ModelUsage {
-                model,
-                calls,
-                tokens,
-                quota_tokens: None,
-                quota_label: None,
-                quota_windows: Vec::new(),
             })
             .collect::<Vec<_>>();
         models.sort_by(|left, right| {
@@ -673,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_history_sources_drops_event_rows_for_database_owned_providers() {
+    fn merge_history_sources_owns_exact_history_identities() {
         let primary = UsageHistory {
             available: true,
             rows: vec![
@@ -731,7 +685,7 @@ mod tests {
 
         let merged = merge_history_sources(primary, &events, since);
 
-        assert_eq!(merged.rows.len(), 2);
+        assert_eq!(merged.rows.len(), 4);
         assert_eq!(
             merged
                 .rows
@@ -739,7 +693,7 @@ mod tests {
                 .filter(|row| row.provider == "nan")
                 .map(|row| row.tokens.billable())
                 .sum::<u64>(),
-            150
+            1_140
         );
         assert_eq!(
             merged
@@ -748,14 +702,18 @@ mod tests {
                 .filter(|row| row.provider == "opencode-go")
                 .map(|row| row.tokens.billable())
                 .sum::<u64>(),
-            45
+            485
         );
-        assert!(
-            merged
-                .rows
-                .iter()
-                .all(|row| row.source != "vibebar-events-31d")
-        );
+        assert!(merged.rows.iter().any(|row| {
+            row.provider == "nan"
+                && row.model == "deepseek-v4-flash"
+                && row.source == "vibebar-events-31d"
+        }));
+        assert!(merged.rows.iter().any(|row| {
+            row.provider == "opencode-go"
+                && row.model == "glm5.2"
+                && row.source == "vibebar-events-31d"
+        }));
     }
 
     #[test]
@@ -830,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_history_sources_normalizes_event_provider_before_ownership_deduplication() {
+    fn merge_history_sources_normalizes_provider_before_exact_key_ownership() {
         let primary = UsageHistory {
             available: true,
             rows: vec![history_row(HistoryRowSpec {
@@ -866,15 +824,93 @@ mod tests {
             since,
         );
 
-        assert_eq!(merged.rows.len(), 1);
+        assert_eq!(merged.rows.len(), 2);
         assert_eq!(merged.rows[0].provider, "nan");
-        assert_eq!(merged.rows[0].tokens.billable(), 150);
-        assert!(
+        assert!(merged.rows.iter().any(|row| {
+            row.provider == "nan"
+                && row.model == "deepseek-v4-flash"
+                && row.source == "vibebar-events-31d"
+        }));
+    }
+
+    #[test]
+    fn merge_history_sources_deduplicates_only_matching_history_identity() {
+        let primary = UsageHistory {
+            available: true,
+            rows: vec![history_row(HistoryRowSpec {
+                day: "2026-08-15",
+                repository: "Repository attribution disabled",
+                agent: "executor",
+                provider: "nan",
+                model: "qwen3.6",
+                source: "opencode-db-messages-31d",
+                source_fidelity: "metadata",
+                input_tokens: 120,
+                output_tokens: 30,
+            })],
+            oldest_day: Some("2026-08-15".into()),
+            newest_day: Some("2026-08-15".into()),
+            truncated: false,
+            repository_attribution_enabled: false,
+        };
+        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
+        let events = vec![
+            event(EventSpec {
+                event_id: "evt-duplicate",
+                occurred_at: Utc.with_ymd_and_hms(2026, 8, 15, 12, 0, 0).unwrap(),
+                provider: " NaN ",
+                model: "qwen3.6",
+                role: "executor",
+                task_id: "task-duplicate",
+                input_tokens: 900,
+                output_tokens: 90,
+            }),
+            event(EventSpec {
+                event_id: "evt-distinct-model",
+                occurred_at: Utc.with_ymd_and_hms(2026, 8, 15, 13, 0, 0).unwrap(),
+                provider: "nan",
+                model: "deepseek-v4-flash",
+                role: "executor",
+                task_id: "task-model",
+                input_tokens: 80,
+                output_tokens: 20,
+            }),
+            event(EventSpec {
+                event_id: "evt-distinct-agent",
+                occurred_at: Utc.with_ymd_and_hms(2026, 8, 15, 14, 0, 0).unwrap(),
+                provider: "nan",
+                model: "qwen3.6",
+                role: "reviewer",
+                task_id: "task-agent",
+                input_tokens: 70,
+                output_tokens: 10,
+            }),
+        ];
+
+        let merged = merge_history_sources(primary, &events, since);
+
+        assert_eq!(merged.rows.len(), 3);
+        assert_eq!(
             merged
                 .rows
                 .iter()
-                .all(|row| row.source != "vibebar-events-31d")
+                .map(|row| row.tokens.billable())
+                .sum::<u64>(),
+            330
         );
+        assert!(merged.rows.iter().any(|row| {
+            row.agent == "executor"
+                && row.model == "qwen3.6"
+                && row.source == "opencode-db-messages-31d"
+        }));
+        assert!(merged.rows.iter().any(|row| {
+            row.agent == "executor"
+                && row.model == "deepseek-v4-flash"
+                && row.source == "vibebar-events-31d"
+        }));
+        assert!(merged.rows.iter().any(|row| {
+            row.agent == "reviewer" && row.model == "qwen3.6" && row.source == "vibebar-events-31d"
+        }));
     }
 
     #[test]
@@ -1023,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_synthesizes_missing_cards_and_reconciles_existing_cards() {
+    fn snapshot_synthesizes_missing_cards_without_overwriting_existing_cards() {
         let now = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
         let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
         let providers = vec![ProviderSnapshot {
@@ -1125,14 +1161,21 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "nan")
             .expect("existing provider card should remain");
-        assert_eq!(nan.source, "opencode-db-messages-31d");
-        assert_eq!(nan.status, "ok");
-        assert_eq!(nan.tokens.billable(), 990);
-        assert_eq!(nan.error, None);
+        assert_eq!(nan.source, "opencode-stats-30d");
+        assert_eq!(nan.status, "error");
+        assert_eq!(nan.tokens.billable(), 0);
+        assert_eq!(nan.error.as_deref(), Some("OpenCode stats unavailable"));
+        assert!(
+            snapshot
+                .usage_history
+                .rows
+                .iter()
+                .any(|row| { row.provider == "nan" && row.tokens.billable() == 990 })
+        );
     }
 
     #[test]
-    fn snapshot_reconciles_existing_provider_totals_with_message_history() {
+    fn snapshot_preserves_existing_provider_stats_when_message_history_exists() {
         let now = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
         let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
         let providers = vec![ProviderSnapshot {
@@ -1163,8 +1206,8 @@ mod tests {
                 quota_windows: vec![crate::domain::ModelQuota {
                     label: "Monthly model allowance".into(),
                     quota_tokens: 500_000_000,
-                    used_percent: Some(99.0),
-                    remaining_percent: Some(1.0),
+                    used_percent: None,
+                    remaining_percent: None,
                     resets_at: None,
                     duration_minutes: None,
                     period_label: "Published monthly token limit".into(),
@@ -1216,11 +1259,69 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "nan")
             .unwrap();
-        assert_eq!(nan.calls, 1);
-        assert_eq!(nan.tokens.billable(), 150);
-        assert_eq!(nan.source, "opencode-db-messages-31d");
-        let used_percent = nan.models[0].quota_windows[0].used_percent.unwrap();
-        assert!((used_percent - 0.00003).abs() < f64::EPSILON);
+        assert_eq!(nan.calls, 100);
+        assert_eq!(nan.tokens.billable(), 67_000_000);
+        assert_eq!(nan.tokens.observed_total(), 190_000_000);
+        assert_eq!(nan.source, "opencode-stats-30d");
+        assert_eq!(nan.status, "ok");
+        assert_eq!(nan.error, None);
+        assert_eq!(nan.models[0].calls, 100);
+        assert_eq!(nan.models[0].tokens.billable(), 67_000_000);
+        assert_eq!(nan.models[0].quota_windows[0].used_percent, None);
+        assert_eq!(
+            snapshot
+                .usage_history
+                .rows
+                .iter()
+                .find(|row| row.provider == "nan")
+                .map(|row| row.tokens.billable()),
+            Some(150)
+        );
+    }
+
+    #[test]
+    fn snapshot_history_only_nan_cards_expose_unmetered_allowance_reference() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
+        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
+        let history = UsageHistory {
+            available: true,
+            rows: vec![history_row(HistoryRowSpec {
+                day: "2026-08-16",
+                repository: "github.com/example/nan",
+                agent: "executor",
+                provider: "nan",
+                model: "deepseek-v4-flash",
+                source: "opencode-db-messages-31d",
+                source_fidelity: "metadata",
+                input_tokens: 10,
+                output_tokens: 2,
+            })],
+            oldest_day: Some("2026-08-16".into()),
+            newest_day: Some("2026-08-16".into()),
+            truncated: false,
+            repository_attribution_enabled: true,
+        };
+
+        let snapshot = build_snapshot_from_sources(SnapshotBuildInputs {
+            now,
+            telemetry_path: "/tmp/events-v1.jsonl".into(),
+            providers: Vec::new(),
+            events: Vec::new(),
+            diagnostics: Vec::new(),
+            opencode_usage: Ok(crate::opencode_history::OpenCodeUsageBundle {
+                history,
+                agent_usage: Vec::new(),
+                diagnostics: Vec::new(),
+            }),
+            history_since: since,
+        });
+
+        let model = &snapshot.providers[0].models[0];
+        assert_eq!(snapshot.providers[0].id, "nan");
+        assert_eq!(model.quota_windows.len(), 1);
+        assert_eq!(model.quota_windows[0].quota_tokens, 500_000_000);
+        assert_eq!(model.quota_windows[0].used_percent, None);
+        assert_eq!(model.quota_windows[0].remaining_percent, None);
     }
 
     #[test]
