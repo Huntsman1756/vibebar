@@ -68,3 +68,4 @@ Desktop.ini
 *.sw?
 *.swp
 *.swo
+.worktrees/
