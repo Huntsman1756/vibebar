@@ -27,7 +27,11 @@ VibeBar launches `opencode stats --pure --days 30 --models` with fixed arguments
 
 ### Rust host → OpenCode local database
 
-VibeBar may open the user's local OpenCode SQLite database read-only to attribute usage to agents. The query selects only bounded aggregate columns from the `session` table (`agent`, `model`, timestamps, session count, and token counters) for the last 30 days. It never reads the `message`, `part`, `session_message`, prompt, response, or source-content tables, and it never copies the database or writes to it. Missing, locked, or schema-incompatible databases produce a visible diagnostic and the event telemetry fallback remains available.
+VibeBar may open the user's local OpenCode SQLite database read-only to attribute usage to agents. The preferred query uses a fixed whitelist of assistant-message metadata fields only: `time_created`, `role`, `agent`, `modelID`, `providerID`, token counters, and source-provided cost. It joins to `session` only for fallback aggregate fields and the transient `session.directory` value used to resolve a repository identifier in memory. The session fallback keeps `agent`, `model`, timestamps, `session.directory`, session count, and token counters for the last 31 local calendar days.
+
+The repository resolver reads `.git/config` and supported worktree indirection only. No other project files are read. The output is a normalized identifier such as `github.com/example/alpha` or `local/demo-project`, not an absolute path. VibeBar makes no GitHub API request, no repository-visibility check, and no network request for repository attribution.
+
+The database adapter never returns raw `message.data` JSON, `part` payloads, prompts, responses, tool content, or source files. It never copies the database or writes to it. Missing, locked, or schema-incompatible databases produce a visible diagnostic and the event telemetry fallback remains available.
 
 ### Local telemetry producer → JSONL store
 

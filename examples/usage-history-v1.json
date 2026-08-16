@@ -1,0 +1,116 @@
+{
+  "rows": [
+    {
+      "day": "2026-08-16",
+      "repository": "github.com/example/alpha",
+      "agent": "executor",
+      "provider": "nan",
+      "model": "qwen3.6",
+      "source": "opencode-db-messages-31d",
+      "sourceFidelity": "metadata",
+      "messageCount": 12,
+      "sessionCount": 3,
+      "tokens": {
+        "inputTokens": 900000,
+        "outputTokens": 45000,
+        "cacheReadTokens": 1200000,
+        "cacheWriteTokens": 0
+      },
+      "costMicrousd": 35000
+    },
+    {
+      "day": "2026-08-15",
+      "repository": "local/demo-project",
+      "agent": "reviewer",
+      "provider": "opencode-go",
+      "model": "qwen3.6",
+      "source": "opencode-db-messages-31d",
+      "sourceFidelity": "metadata",
+      "messageCount": 5,
+      "sessionCount": 2,
+      "tokens": {
+        "inputTokens": 320000,
+        "outputTokens": 28000,
+        "cacheReadTokens": 210000,
+        "cacheWriteTokens": 0
+      },
+      "costMicrousd": 14000
+    },
+    {
+      "day": "2026-08-12",
+      "repository": "github.com/example/alpha",
+      "agent": "reviewer",
+      "provider": "custom-provider",
+      "model": "glm5.2",
+      "source": "opencode-db-session-31d-fallback",
+      "sourceFidelity": "session-fallback",
+      "messageCount": 0,
+      "sessionCount": 2,
+      "tokens": {
+        "inputTokens": 210000,
+        "outputTokens": 17000,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 15000
+      },
+      "costMicrousd": null
+    },
+    {
+      "day": "2026-08-10",
+      "repository": "local/demo-project",
+      "agent": "executor",
+      "provider": "nan",
+      "model": "deepseek-v4-flash",
+      "source": "opencode-db-messages-31d",
+      "sourceFidelity": "metadata",
+      "messageCount": 7,
+      "sessionCount": 1,
+      "tokens": {
+        "inputTokens": 410000,
+        "outputTokens": 36000,
+        "cacheReadTokens": 640000,
+        "cacheWriteTokens": 0
+      },
+      "costMicrousd": 18000
+    },
+    {
+      "day": "2026-08-01",
+      "repository": "github.com/example/alpha",
+      "agent": "executor",
+      "provider": "custom-provider",
+      "model": "glm5.2",
+      "source": "vibebar-events-31d",
+      "sourceFidelity": "event-fallback",
+      "messageCount": 0,
+      "sessionCount": 0,
+      "tokens": {
+        "inputTokens": 180000,
+        "outputTokens": 15000,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0
+      },
+      "costMicrousd": null
+    },
+    {
+      "day": "2026-07-18",
+      "repository": "local/demo-project",
+      "agent": "reviewer",
+      "provider": "opencode-go",
+      "model": "qwen3.6",
+      "source": "vibebar-events-31d",
+      "sourceFidelity": "event-fallback",
+      "messageCount": 0,
+      "sessionCount": 0,
+      "tokens": {
+        "inputTokens": 150000,
+        "outputTokens": 12000,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0
+      },
+      "costMicrousd": null
+    }
+  ],
+  "oldestDay": "2026-07-18",
+  "newestDay": "2026-08-16",
+  "truncated": false,
+  "repositoryAttributionEnabled": true
+}

@@ -18,7 +18,7 @@ Date: August 16, 2026
 Focused command run before implementation:
 
 ```sh
-rtk cargo test --manifest-path /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar/src-tauri/Cargo.toml opencode_history::tests
+rtk cargo test --manifest-path src-tauri/Cargo.toml opencode_history::tests
 ```
 
 Observed failure:
@@ -34,7 +34,7 @@ This confirmed the test-first gap: the new adapter functions did not exist yet.
 Focused adapter suite:
 
 ```sh
-rtk cargo test --manifest-path /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar/src-tauri/Cargo.toml opencode_history::tests
+rtk cargo test --manifest-path src-tauri/Cargo.toml opencode_history::tests
 ```
 
 Result:
@@ -46,7 +46,7 @@ cargo test: 4 passed, 31 filtered out (3 suites, 0.00s)
 Collector regression suite:
 
 ```sh
-rtk cargo test --manifest-path /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar/src-tauri/Cargo.toml collectors::tests
+rtk cargo test --manifest-path src-tauri/Cargo.toml collectors::tests
 ```
 
 Result:
@@ -58,7 +58,7 @@ cargo test: 7 passed, 28 filtered out (3 suites, 0.46s)
 Full Rust suite:
 
 ```sh
-rtk cargo test --manifest-path /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar/src-tauri/Cargo.toml
+rtk cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 Result:
@@ -70,7 +70,7 @@ cargo test: 35 passed (4 suites, 0.22s)
 Whitespace check:
 
 ```sh
-rtk git -C /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar diff --check
+rtk git diff --check
 ```
 
 Result: no output, no whitespace errors.
@@ -112,7 +112,7 @@ Result: no output, no whitespace errors.
 Focused RED command after adding the new regression tests:
 
 ```sh
-rtk cargo test --manifest-path /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar/src-tauri/Cargo.toml opencode_history::tests
+rtk cargo test --manifest-path src-tauri/Cargo.toml opencode_history::tests
 ```
 
 Observed failure:
@@ -129,7 +129,7 @@ This confirmed the missing pieces for the review findings before implementation:
 Focused history regression suite:
 
 ```sh
-rtk cargo test --manifest-path /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar/src-tauri/Cargo.toml opencode_history::tests
+rtk cargo test --manifest-path src-tauri/Cargo.toml opencode_history::tests
 ```
 
 Result:
@@ -141,7 +141,7 @@ cargo test: 7 passed, 32 filtered out (3 suites, 0.01s)
 Focused snapshot diagnostic test:
 
 ```sh
-rtk cargo test --manifest-path /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar/src-tauri/Cargo.toml session_fallback_agent_usage_produces_snapshot_diagnostic
+rtk cargo test --manifest-path src-tauri/Cargo.toml session_fallback_agent_usage_produces_snapshot_diagnostic
 ```
 
 Result:
@@ -153,7 +153,7 @@ cargo test: 1 passed, 38 filtered out (3 suites, 0.00s)
 Full Rust suite:
 
 ```sh
-rtk cargo test --manifest-path /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar/src-tauri/Cargo.toml
+rtk cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 Result:

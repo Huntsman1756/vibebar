@@ -1,6 +1,6 @@
 # VibeBar
 
-VibeBar is a local-first system-tray monitor for AI coding agents on Windows, macOS, and Linux. It shows provider capacity, token usage, historical history, and orchestration quality in one local dashboard without sending private data to a backend.
+VibeBar is a local-first system-tray monitor for AI coding agents on Windows, macOS, and Linux. It shows provider capacity, token usage, repository-safe history, and orchestration quality in one local dashboard without sending private data to a backend.
 
 ## What it reads
 
@@ -31,6 +31,8 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin vibebar-ingest < examples/e
 
 The command prints the number of newly appended events. Replaying the same file prints `0`.
 
+The repository also includes a sanitized historical fixture at `examples/usage-history-v1.json`. It contains only synthetic providers, models, agents, repositories, and token counts.
+
 ## Development
 
 Before sending changes, run:
@@ -50,10 +52,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution checklist, fixture r
 
 The historical dashboard uses the operating system's local calendar and a single bounded daily series to derive:
 
-- `Today`
-- `7 days`
-- `30 days`
-- `This month`
+- `Today`: from local midnight through the current time.
+- `7 days`: the current local day plus the six preceding local calendar days.
+- `30 days`: the current local day plus the 29 preceding local calendar days.
+- `This month`: from the first day of the current local month through the current time.
 
 The backend keeps only the most recent 31 local calendar days. The frontend slices that shared series so the chart and tables stay consistent across periods.
 
@@ -74,13 +76,15 @@ Quota percentages may exceed 100 in detailed views so exhausted limits stay visi
 
 Provider IDs stay distinct. `nan` renders as `NaN`, `opencode-go` renders as `OpenCode Go`, and unknown provider IDs remain visible rather than being collapsed into a different provider.
 
-Repository attribution is local-only. For both public and private local repositories, VibeBar reads local Git metadata, normalizes the remote into a repository identifier such as `github.com/owner/repository`, and never serializes the absolute path. If no remote is available, the UI falls back to a local directory-based identifier. VibeBar never calls GitHub, checks repository visibility, or sends repository identifiers over the network.
+Repository attribution is local-only. For both public and private local repositories, VibeBar uses `session.directory` only long enough to read local Git metadata and normalize the result into an identifier such as `github.com/example/alpha` or `local/demo-project`. It never serializes the absolute path, never calls the GitHub API, never checks repository visibility, and never sends repository identifiers over the network.
 
 Source fidelity stays explicit:
 
 - assistant-message metadata is the preferred source when available,
-- the session-table adapter is the lower-fidelity fallback,
-- VibeBar telemetry is the final fallback when OpenCode attribution is unavailable.
+- the session-table adapter is the lower-fidelity fallback because a whole session may land on its last update day,
+- VibeBar telemetry is the final provider/model/agent/day fallback when OpenCode attribution is unavailable.
+
+Event fallback remains intentionally limited: V1 telemetry does not carry a repository or path field, so event-only history rows cannot attribute usage to `github.com/example/alpha`, `local/demo-project`, or any other repository unless a future explicitly sanitized schema version adds that field.
 
 ## Privacy limits
 

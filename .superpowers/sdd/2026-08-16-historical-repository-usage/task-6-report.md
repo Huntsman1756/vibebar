@@ -35,14 +35,14 @@ Initial frontend test run before `src/history.ts` existed:
 ```text
 $ rtk npm run test:frontend
 > vitest run
- RUN  v3.2.7 /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar
+ RUN  v3.2.7 <repo-root>
  Test Files  1 failed (1)
       Tests  no tests
    Start at  18:39:02
    Duration  363ms (transform 26ms, setup 0ms, collect 0ms, tests 0ms, environment 0ms, prepare 31ms)
 
  FAIL  src/history.test.ts [ src/history.test.ts ]
-Error: Cannot find module './history' imported from '/Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar/src/history.test.ts'
+Error: Cannot find module './history' imported from '<repo-root>/src/history.test.ts'
 ```
 
 ## GREEN Evidence
@@ -52,7 +52,7 @@ Focused frontend selector suite on the final tree:
 ```text
 $ rtk npm run test:frontend
 > vitest run
- RUN  v3.2.7 /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar
+ RUN  v3.2.7 <repo-root>
  ✓ src/history.test.ts (6 tests) 10ms
  Test Files  1 passed (1)
       Tests  6 passed (6)
@@ -113,7 +113,7 @@ Focused frontend test run before the new helpers existed:
 ```text
 $ rtk npm run test:frontend
 > vitest run
- RUN  v3.2.7 /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar
+ RUN  v3.2.7 <repo-root>
  ❯ src/history.test.ts (9 tests | 3 failed) 12ms
    × aggregateHistoryByProviderTotals > collapses multiple models into provider totals and keeps tie ordering deterministic
      → (0 , aggregateHistoryByProviderTotals) is not a function
@@ -130,7 +130,7 @@ Focused frontend selector suite on the final fix tree:
 ```text
 $ rtk npm run test:frontend
 > vitest run
- RUN  v3.2.7 /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar
+ RUN  v3.2.7 <repo-root>
  ✓ src/history.test.ts (9 tests) 19ms
  Test Files  1 passed (1)
       Tests  9 passed (9)
