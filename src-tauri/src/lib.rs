@@ -1,5 +1,7 @@
 mod collectors;
 pub mod domain;
+mod history;
+mod identity;
 pub mod storage;
 
 pub const APP_IDENTIFIER: &str = "com.huntsman.vibebar";
@@ -11,8 +13,8 @@ use std::{
 
 use chrono::{Duration, Utc};
 use domain::{
-    DashboardSnapshot, RecentEvent, UsageEvent, aggregate_agent_usage, aggregate_workflow,
-    merge_agent_usage,
+    DashboardSnapshot, RecentEvent, UsageEvent, UsageHistory, aggregate_agent_usage,
+    aggregate_workflow, merge_agent_usage,
 };
 use tauri::{
     Manager, State,
@@ -100,6 +102,7 @@ fn build_snapshot(data_dir: &std::path::Path) -> DashboardSnapshot {
         telemetry_path: storage::telemetry_path(data_dir).display().to_string(),
         providers,
         agent_usage,
+        usage_history: UsageHistory::default(),
         workflow: aggregate_workflow(&events),
         recent_events,
         diagnostics,

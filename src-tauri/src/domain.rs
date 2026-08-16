@@ -168,6 +168,45 @@ pub struct AgentUsage {
     pub tokens: TokenUsage,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageHistoryRow {
+    pub day: String,
+    pub repository: String,
+    pub agent: String,
+    pub provider: String,
+    pub model: String,
+    pub source: String,
+    pub source_fidelity: String,
+    pub message_count: u64,
+    pub session_count: u64,
+    pub tokens: TokenUsage,
+    pub cost_microusd: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageHistory {
+    #[serde(default)]
+    pub rows: Vec<UsageHistoryRow>,
+    pub oldest_day: Option<String>,
+    pub newest_day: Option<String>,
+    pub truncated: bool,
+    pub repository_attribution_enabled: bool,
+}
+
+impl Default for UsageHistory {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            oldest_day: None,
+            newest_day: None,
+            truncated: false,
+            repository_attribution_enabled: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardSnapshot {
@@ -175,10 +214,14 @@ pub struct DashboardSnapshot {
     pub telemetry_path: String,
     pub providers: Vec<ProviderSnapshot>,
     pub agent_usage: Vec<AgentUsage>,
+    #[serde(default)]
+    pub usage_history: UsageHistory,
     pub workflow: WorkflowMetrics,
     pub recent_events: Vec<RecentEvent>,
     pub diagnostics: Vec<String>,
 }
+
+const MAX_USAGE_HISTORY_ROWS: usize = 1_000;
 
 pub fn aggregate_workflow(events: &[UsageEvent]) -> WorkflowMetrics {
     let mut task_states: BTreeMap<&str, bool> = BTreeMap::new();
@@ -330,6 +373,97 @@ pub fn merge_agent_usage(primary: Vec<AgentUsage>, fallback: Vec<AgentUsage>) ->
     merged
 }
 
+pub fn aggregate_history_rows(rows: impl IntoIterator<Item = UsageHistoryRow>) -> UsageHistory {
+    let mut grouped: BTreeMap<
+        (String, String, String, String, String, String, String),
+        UsageHistoryRow,
+    > = BTreeMap::new();
+
+    for row in rows {
+        let key = (
+            row.day.clone(),
+            row.repository.clone(),
+            row.agent.clone(),
+            row.provider.clone(),
+            row.model.clone(),
+            row.source.clone(),
+            row.source_fidelity.clone(),
+        );
+        let entry = grouped.entry(key).or_insert_with(|| UsageHistoryRow {
+            day: row.day.clone(),
+            repository: row.repository.clone(),
+            agent: row.agent.clone(),
+            provider: row.provider.clone(),
+            model: row.model.clone(),
+            source: row.source.clone(),
+            source_fidelity: row.source_fidelity.clone(),
+            message_count: 0,
+            session_count: 0,
+            tokens: TokenUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            cost_microusd: None,
+        });
+        entry.message_count = entry.message_count.saturating_add(row.message_count);
+        entry.session_count = entry.session_count.saturating_add(row.session_count);
+        entry.tokens.input_tokens = entry
+            .tokens
+            .input_tokens
+            .saturating_add(row.tokens.input_tokens);
+        entry.tokens.output_tokens = entry
+            .tokens
+            .output_tokens
+            .saturating_add(row.tokens.output_tokens);
+        entry.tokens.cache_read_tokens = entry
+            .tokens
+            .cache_read_tokens
+            .saturating_add(row.tokens.cache_read_tokens);
+        entry.tokens.cache_write_tokens = entry
+            .tokens
+            .cache_write_tokens
+            .saturating_add(row.tokens.cache_write_tokens);
+        entry.cost_microusd = match (entry.cost_microusd, row.cost_microusd) {
+            (Some(left), Some(right)) => Some(left.saturating_add(right)),
+            (Some(left), None) => Some(left),
+            (None, Some(right)) => Some(right),
+            (None, None) => None,
+        };
+    }
+
+    let oldest_day = grouped.values().map(|row| row.day.as_str()).min().map(str::to_owned);
+    let newest_day = grouped.values().map(|row| row.day.as_str()).max().map(str::to_owned);
+    let repository_attribution_enabled = grouped.values().any(|row| !row.repository.is_empty());
+
+    let mut rows = grouped.into_values().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .tokens
+            .billable()
+            .cmp(&left.tokens.billable())
+            .then_with(|| left.day.cmp(&right.day))
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.model.cmp(&right.model))
+            .then_with(|| left.agent.cmp(&right.agent))
+            .then_with(|| left.repository.cmp(&right.repository))
+    });
+
+    let truncated = rows.len() > MAX_USAGE_HISTORY_ROWS;
+    if truncated {
+        rows.truncate(MAX_USAGE_HISTORY_ROWS);
+    }
+
+    UsageHistory {
+        rows,
+        oldest_day,
+        newest_day,
+        truncated,
+        repository_attribution_enabled,
+    }
+}
+
 pub fn validate_batch(events: &[UsageEvent]) -> Result<(), String> {
     if events.is_empty() || events.len() > 1_000 {
         return Err("event batch must contain 1..1000 items".into());
@@ -347,6 +481,39 @@ pub fn validate_batch(events: &[UsageEvent]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn history_row(
+        day: &str,
+        repository: &str,
+        agent: &str,
+        provider: &str,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        message_count: u64,
+        session_count: u64,
+        cost_microusd: Option<u64>,
+    ) -> UsageHistoryRow {
+        UsageHistoryRow {
+            day: day.into(),
+            repository: repository.into(),
+            agent: agent.into(),
+            provider: provider.into(),
+            model: model.into(),
+            source: "opencode-db-30d".into(),
+            source_fidelity: "message-metadata".into(),
+            message_count,
+            session_count,
+            tokens: TokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens: 0,
+            },
+            cost_microusd,
+        }
+    }
 
     fn event(id: &str, task: &str, kind: EventKind) -> UsageEvent {
         UsageEvent {
@@ -561,5 +728,137 @@ mod tests {
             event("same", "b", EventKind::AttemptStarted),
         ];
         assert!(validate_batch(&events).unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn history_rows_preserve_distinct_dimensions_and_sum_matching_rows() {
+        let history = aggregate_history_rows(vec![
+            history_row(
+                "2026-08-16",
+                "github.com/example/alpha",
+                "executor",
+                "nan",
+                "qwen3.6",
+                10,
+                5,
+                100,
+                2,
+                1,
+                Some(8),
+            ),
+            history_row(
+                "2026-08-16",
+                "github.com/example/alpha",
+                "executor",
+                "nan",
+                "qwen3.6",
+                7,
+                3,
+                50,
+                1,
+                2,
+                Some(4),
+            ),
+            history_row(
+                "2026-08-16",
+                "github.com/example/beta",
+                "executor",
+                "nan",
+                "qwen3.6",
+                9,
+                1,
+                0,
+                1,
+                1,
+                Some(3),
+            ),
+            history_row(
+                "2026-08-16",
+                "github.com/example/alpha",
+                "reviewer",
+                "nan",
+                "qwen3.6",
+                8,
+                1,
+                0,
+                1,
+                1,
+                None,
+            ),
+            history_row(
+                "2026-08-16",
+                "github.com/example/alpha",
+                "executor",
+                "opencode-go",
+                "qwen3.6",
+                6,
+                1,
+                0,
+                1,
+                1,
+                Some(2),
+            ),
+            history_row(
+                "2026-08-16",
+                "github.com/example/alpha",
+                "executor",
+                "nan",
+                "glm5.2",
+                5,
+                4,
+                0,
+                1,
+                1,
+                Some(5),
+            ),
+        ]);
+
+        assert_eq!(history.oldest_day.as_deref(), Some("2026-08-16"));
+        assert_eq!(history.newest_day.as_deref(), Some("2026-08-16"));
+        assert!(!history.truncated);
+        assert!(history.repository_attribution_enabled);
+        assert_eq!(history.rows.len(), 5);
+
+        let merged = history.rows.first().unwrap();
+        assert_eq!(merged.repository, "github.com/example/alpha");
+        assert_eq!(merged.agent, "executor");
+        assert_eq!(merged.provider, "nan");
+        assert_eq!(merged.model, "qwen3.6");
+        assert_eq!(merged.message_count, 3);
+        assert_eq!(merged.session_count, 3);
+        assert_eq!(merged.tokens.input_tokens, 17);
+        assert_eq!(merged.tokens.output_tokens, 8);
+        assert_eq!(merged.tokens.cache_read_tokens, 150);
+        assert_eq!(merged.tokens.billable(), 25);
+        assert_eq!(merged.cost_microusd, Some(12));
+    }
+
+    #[test]
+    fn dashboard_snapshot_serializes_empty_usage_history() {
+        let snapshot = DashboardSnapshot {
+            generated_at: "2026-08-16T12:00:00Z".into(),
+            telemetry_path: "/tmp/events-v1.jsonl".into(),
+            providers: Vec::new(),
+            agent_usage: Vec::new(),
+            usage_history: UsageHistory::default(),
+            workflow: WorkflowMetrics::default(),
+            recent_events: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(value["usageHistory"]["rows"], serde_json::json!([]));
+        assert_eq!(value["usageHistory"]["truncated"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn usage_history_defaults_to_disabled_empty_state() {
+        let history = UsageHistory::default();
+
+        assert!(history.rows.is_empty());
+        assert_eq!(history.oldest_day, None);
+        assert_eq!(history.newest_day, None);
+        assert!(!history.truncated);
+        assert!(!history.repository_attribution_enabled);
     }
 }

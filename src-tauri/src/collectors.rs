@@ -17,6 +17,7 @@ use wait_timeout::ChildExt;
 use crate::domain::{
     AgentUsage, ModelQuota, ModelUsage, ProviderSnapshot, QuotaWindow, TokenUsage,
 };
+use crate::identity::{normalize_provider_id, provider_label};
 
 const MAX_COLLECTOR_OUTPUT: u64 = 8 * 1024 * 1024;
 
@@ -169,9 +170,9 @@ pub fn parse_opencode_stats(output: &str) -> Result<Vec<ProviderSnapshot>, Strin
         let line = raw.trim().trim_matches('│').trim();
         if line.contains('/') && !line.contains(' ') && !line.starts_with("http") {
             if let Some((provider, model)) = line.split_once('/') {
-                current = Some((provider.to_lowercase(), model.to_string()));
+                current = Some((normalize_provider_id(provider), model.to_string()));
                 usages
-                    .entry((provider.to_lowercase(), model.to_string()))
+                    .entry((normalize_provider_id(provider), model.to_string()))
                     .or_insert(ModelUsage {
                         model: model.to_string(),
                         calls: 0,
@@ -313,25 +314,6 @@ pub fn quota_windows_for(provider: &str, model: &str, billable_tokens: u64) -> V
     }
 }
 
-fn provider_label(provider: &str) -> String {
-    match provider {
-        "nan" => "NaN".into(),
-        "openai" => "OpenAI via OpenCode".into(),
-        "anthropic" => "Anthropic via OpenCode".into(),
-        other => other
-            .split(['-', '_'])
-            .map(|part| {
-                let mut chars = part.chars();
-                chars
-                    .next()
-                    .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-                    .unwrap_or_default()
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-    }
-}
-
 fn sum_tokens<'a>(tokens: impl Iterator<Item = &'a TokenUsage>) -> TokenUsage {
     tokens.fold(
         TokenUsage {
@@ -385,12 +367,12 @@ fn opencode_model_identity(raw_model: &str) -> (String, String) {
             .and_then(Value::as_str)
             .unwrap_or("opencode");
         let model = value.get("id").and_then(Value::as_str).unwrap_or(raw_model);
-        return (provider.to_lowercase(), model.to_string());
+        return (normalize_provider_id(provider), model.to_string());
     }
     raw_model
         .split_once('/')
-        .map(|(provider, model)| (provider.to_lowercase(), model.to_string()))
-        .unwrap_or_else(|| ("opencode".into(), raw_model.into()))
+        .map(|(provider, model)| (normalize_provider_id(provider), model.to_string()))
+        .unwrap_or_else(|| (normalize_provider_id("opencode"), raw_model.into()))
 }
 
 fn query_opencode_agent_usage(
