@@ -13,7 +13,7 @@ VibeBar must not collect prompts, responses, source code, diffs, browser cookies
 
 ### Tauri frontend → Rust commands
 
-Only the bundled `main` window receives the default capability. Event ingestion uses a strict typed structure, rejects unknown fields, caps each batch at 1,000 events, and writes only to the app-owned telemetry path. The CSP allows bundled resources and Tauri IPC only.
+Both bundled `main` and `popover` windows receive the default capability. Event ingestion uses a strict typed structure, rejects unknown fields, caps each batch at 1,000 events, and writes only to the app-owned telemetry path. The CSP allows bundled resources and Tauri IPC only.
 
 ### Rust host → Codex App Server
 
@@ -23,7 +23,7 @@ This remains a personal-subscription trust boundary: the installed Codex binary 
 
 ### Rust host → OpenCode
 
-VibeBar launches `opencode stats --pure --days 30 --models` with fixed arguments. `--pure` disables external plugins for the collection run. The command receives the same credential-scrubbed environment, has a 25-second timeout, and has an 8 MiB combined-output ceiling. Its terminal output is parsed as untrusted, version-sensitive input; parse failure is visible and never triggers an alternate credential source.
+VibeBar launches `opencode stats --pure --days 30 --models` with fixed arguments. `--pure` disables external plugins for the collection run. The command receives the same credential-scrubbed environment, has a 5-second timeout, and has an 8 MiB combined-output ceiling. Its terminal output is parsed as untrusted, version-sensitive input; parse failure is visible and never triggers an alternate credential source.
 
 ### Rust host → OpenCode local database
 

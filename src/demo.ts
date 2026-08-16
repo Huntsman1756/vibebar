@@ -22,6 +22,7 @@ export const demoSnapshot: DashboardSnapshot = {
     { agent: "escalationExecutor", provider: "nan", model: "deepseek-v4-flash", source: "vibebar-events-30d", calls: 12, tasks: 8, tokens: { inputTokens: 4_700_000, outputTokens: 500_000, cacheReadTokens: 6_000_000, cacheWriteTokens: 0 } },
   ],
   usageHistory: {
+    available: true,
     rows: [
       { day: "2026-08-16", repository: "github.com/example/alpha", agent: "executor", provider: "nan", model: "qwen3.6", source: "opencode-db-messages-31d", sourceFidelity: "metadata", messageCount: 14, sessionCount: 4, tokens: { inputTokens: 9_800_000, outputTokens: 440_000, cacheReadTokens: 21_000_000, cacheWriteTokens: 0 }, costMicrousd: 420_000 },
       { day: "2026-08-16", repository: "github.com/example/beta", agent: "reviewer", provider: "opencode-go", model: "qwen3.6", source: "opencode-db-messages-31d", sourceFidelity: "metadata", messageCount: 6, sessionCount: 2, tokens: { inputTokens: 2_400_000, outputTokens: 210_000, cacheReadTokens: 3_100_000, cacheWriteTokens: 0 }, costMicrousd: 105_000 },

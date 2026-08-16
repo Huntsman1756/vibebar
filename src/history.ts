@@ -5,6 +5,7 @@ import type {
   ProviderHistorySummary,
   ProviderTotalHistorySummary,
   RepositoryHistorySummary,
+  UsageHistory,
   UsageHistoryRow,
 } from "./types";
 
@@ -199,7 +200,12 @@ export function buildProviderToneMap(
   summaries: ProviderTotalHistorySummary[],
   tones: readonly string[],
 ): Map<string, string> {
-  return new Map(summaries.map((summary, index) => [summary.provider, tones[index % tones.length] ?? tones[0] ?? "mint"]));
+  const providers = [...new Set(summaries.map((summary) => summary.provider))].sort(compareText);
+  return new Map(providers.map((provider, index) => [provider, tones[index % tones.length] ?? tones[0] ?? "mint"]));
+}
+
+export function isHistoryUnavailable(history: UsageHistory): boolean {
+  return history.available === false;
 }
 
 export function aggregateHistoryByRepository(rows: UsageHistoryRow[]): RepositoryHistorySummary[] {

@@ -5,7 +5,7 @@ use std::{
     process::{Command, Stdio},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -18,6 +18,15 @@ use crate::identity::{normalize_provider_id, provider_label};
 
 const MAX_COLLECTOR_OUTPUT: u64 = 8 * 1024 * 1024;
 const OPENCODE_COLLECTOR_TIMEOUT: Duration = Duration::from_secs(5);
+const CODEX_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn codex_handshake_deadline(started: Instant) -> Instant {
+    started + CODEX_HANDSHAKE_TIMEOUT
+}
+
+fn remaining_codex_timeout(deadline: Instant, now: Instant) -> Option<Duration> {
+    deadline.checked_duration_since(now)
+}
 
 fn resolve_program(program: &str) -> PathBuf {
     let mut candidates = Vec::new();
@@ -454,10 +463,13 @@ pub fn collect_codex_rate_limits() -> Result<ProviderSnapshot, String> {
             }
         }
     });
+    let deadline = codex_handshake_deadline(Instant::now());
 
     let receive_response = |expected_id: i64, timeout_message: &str| -> Result<Value, String> {
         loop {
-            match receiver.recv_timeout(Duration::from_secs(10)) {
+            let timeout = remaining_codex_timeout(deadline, Instant::now())
+                .ok_or_else(|| timeout_message.to_string())?;
+            match receiver.recv_timeout(timeout) {
                 Ok(response) if response.get("id").and_then(Value::as_i64) == Some(expected_id) => {
                     return Ok(response);
                 }
@@ -703,5 +715,21 @@ done
     #[test]
     fn opencode_stats_timeout_stays_user_responsive() {
         assert_eq!(opencode_collector_timeout(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn codex_handshake_uses_one_overall_deadline_for_all_responses() {
+        let started = Instant::now();
+        let deadline = codex_handshake_deadline(started);
+
+        assert_eq!(deadline.duration_since(started), Duration::from_secs(10));
+        assert_eq!(
+            remaining_codex_timeout(deadline, started + Duration::from_secs(7)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            remaining_codex_timeout(deadline, started + Duration::from_secs(11)),
+            None
+        );
     }
 }

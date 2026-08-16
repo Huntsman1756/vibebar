@@ -57,7 +57,7 @@ fn opencode_history_session_fallback_diagnostic(history: &UsageHistory) -> Optio
 fn usage_history_truncation_diagnostic(history: &UsageHistory) -> Option<String> {
     history
         .truncated
-        .then(|| "Usage history is truncated to the most recent 1000 aggregated rows.".into())
+        .then(|| "Usage history is truncated to the highest-ranked 1000 aggregated rows.".into())
 }
 
 fn local_history_window_start(now: DateTime<Utc>) -> DateTime<Utc> {
@@ -79,8 +79,9 @@ fn provider_history_from_events(events: &[UsageEvent], since: DateTime<Utc>) -> 
     aggregate_history_rows(events.iter().filter_map(|event| {
         (event.occurred_at >= since).then_some(())?;
         let tokens = event.tokens.as_ref()?;
+        let day = history::local_day(event.occurred_at.timestamp_millis())?;
         Some(UsageHistoryRow {
-            day: history::local_day(event.occurred_at.timestamp_millis()),
+            day,
             repository: REPOSITORY_ATTRIBUTION_DISABLED.into(),
             agent: event.role.clone(),
             provider: normalize_provider_id(&event.provider),
@@ -118,6 +119,7 @@ fn merge_history_sources(
     merged.repository_attribution_enabled = primary.repository_attribution_enabled
         || event_history.repository_attribution_enabled
         || merged.repository_attribution_enabled;
+    merged.available = primary.available || event_history.available || merged.available;
     merged
 }
 
@@ -235,8 +237,7 @@ struct SnapshotBuildInputs {
     providers: Vec<domain::ProviderSnapshot>,
     events: Vec<UsageEvent>,
     diagnostics: Vec<String>,
-    opencode_agent_usage: Result<Vec<domain::AgentUsage>, String>,
-    opencode_history: Result<UsageHistory, String>,
+    opencode_usage: Result<opencode_history::OpenCodeUsageBundle, String>,
     history_since: DateTime<Utc>,
 }
 
@@ -247,15 +248,24 @@ fn build_snapshot_from_sources(inputs: SnapshotBuildInputs) -> DashboardSnapshot
         providers,
         events,
         mut diagnostics,
-        opencode_agent_usage,
-        opencode_history,
+        opencode_usage,
         history_since,
     } = inputs;
-    let usage_history = match opencode_history {
-        Ok(primary) => merge_history_sources(primary, &events, history_since),
+    let (usage_history, opencode_agent_usage) = match opencode_usage {
+        Ok(bundle) => {
+            diagnostics.extend(bundle.diagnostics);
+            (
+                merge_history_sources(bundle.history, &events, history_since),
+                Some(bundle.agent_usage),
+            )
+        }
         Err(error) => {
             diagnostics.push(error);
-            provider_history_from_events(&events, history_since)
+            let mut event_history = provider_history_from_events(&events, history_since);
+            if event_history.rows.is_empty() {
+                event_history.available = false;
+            }
+            (event_history, None)
         }
     };
     let providers = synthesize_history_only_provider_cards(providers, &usage_history, now);
@@ -274,16 +284,13 @@ fn build_snapshot_from_sources(inputs: SnapshotBuildInputs) -> DashboardSnapshot
         .collect();
     let event_agent_usage = aggregate_agent_usage(&events, now - Duration::days(30));
     let agent_usage = match opencode_agent_usage {
-        Ok(opencode_usage) => {
+        Some(opencode_usage) => {
             if let Some(diagnostic) = opencode_session_fallback_diagnostic(&opencode_usage) {
                 diagnostics.push(diagnostic);
             }
             opencode_history::merge_agent_usage_sources(opencode_usage, event_agent_usage)
         }
-        Err(error) => {
-            diagnostics.push(error);
-            event_agent_usage
-        }
+        None => event_agent_usage,
     };
     if let Some(diagnostic) = opencode_history_session_fallback_diagnostic(&usage_history) {
         diagnostics.push(diagnostic);
@@ -361,8 +368,7 @@ fn build_snapshot(data_dir: &std::path::Path) -> DashboardSnapshot {
         providers,
         events,
         diagnostics,
-        opencode_agent_usage: opencode_history::collect_opencode_agents(),
-        opencode_history: opencode_history::collect_opencode_history(),
+        opencode_usage: opencode_history::collect_opencode_usage(),
         history_since,
     })
 }
@@ -592,6 +598,7 @@ mod tests {
     #[test]
     fn merge_history_sources_drops_event_rows_for_database_owned_providers() {
         let primary = UsageHistory {
+            available: true,
             rows: vec![
                 history_row(HistoryRowSpec {
                     day: "2026-08-15",
@@ -677,6 +684,7 @@ mod tests {
     #[test]
     fn merge_history_sources_keeps_event_only_rows_for_non_database_providers() {
         let primary = UsageHistory {
+            available: true,
             rows: vec![
                 history_row(HistoryRowSpec {
                     day: "2026-08-15",
@@ -747,6 +755,7 @@ mod tests {
     #[test]
     fn merge_history_sources_normalizes_event_provider_before_ownership_deduplication() {
         let primary = UsageHistory {
+            available: true,
             rows: vec![history_row(HistoryRowSpec {
                 day: "2026-08-15",
                 repository: "github.com/example/alpha",
@@ -843,6 +852,7 @@ mod tests {
             provider("nan", "NaN", "opencode-stats-30d"),
         ];
         let primary_history = UsageHistory {
+            available: true,
             rows: vec![history_row(HistoryRowSpec {
                 day: "2026-08-16",
                 repository: "github.com/example/alpha",
@@ -874,8 +884,13 @@ mod tests {
                 output_tokens: 20,
             })],
             diagnostics: vec!["ignored malformed telemetry line 3".into()],
-            opencode_agent_usage: Ok(vec![usage("opencode-db-messages-31d")]),
-            opencode_history: Ok(primary_history),
+            opencode_usage: Ok(crate::opencode_history::OpenCodeUsageBundle {
+                history: primary_history,
+                agent_usage: vec![usage("opencode-db-messages-31d")],
+                diagnostics: vec![
+                    "Skipped 1 OpenCode assistant metadata row with an invalid timestamp.".into(),
+                ],
+            }),
             history_since: since,
         });
 
@@ -911,6 +926,12 @@ mod tests {
                 .any(|item| item.contains("truncated"))
         );
         assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|item| item.contains("invalid timestamp"))
+        );
+        assert!(
             snapshot.usage_history.rows.iter().any(|row| {
                 row.provider == "chatgpt-codex" && row.source == "vibebar-events-31d"
             })
@@ -939,6 +960,7 @@ mod tests {
             error: Some("OpenCode stats unavailable".into()),
         }];
         let primary_history = UsageHistory {
+            available: true,
             rows: vec![
                 history_row(HistoryRowSpec {
                     day: "2026-08-16",
@@ -986,8 +1008,11 @@ mod tests {
             providers,
             events: Vec::new(),
             diagnostics: Vec::new(),
-            opencode_agent_usage: Ok(Vec::new()),
-            opencode_history: Ok(primary_history),
+            opencode_usage: Ok(crate::opencode_history::OpenCodeUsageBundle {
+                history: primary_history,
+                agent_usage: Vec::new(),
+                diagnostics: Vec::new(),
+            }),
             history_since: since,
         });
 
@@ -1018,5 +1043,29 @@ mod tests {
         assert_eq!(nan.source, "opencode-stats-30d");
         assert_eq!(nan.status, "error");
         assert_eq!(nan.error.as_deref(), Some("OpenCode stats unavailable"));
+    }
+
+    #[test]
+    fn snapshot_marks_history_unavailable_when_database_and_event_fallback_have_no_rows() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
+        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
+        let snapshot = build_snapshot_from_sources(SnapshotBuildInputs {
+            now,
+            telemetry_path: "/tmp/events-v1.jsonl".into(),
+            providers: Vec::new(),
+            events: Vec::new(),
+            diagnostics: Vec::new(),
+            opencode_usage: Err("OpenCode history database is unavailable".into()),
+            history_since: since,
+        });
+
+        assert!(!snapshot.usage_history.available);
+        assert!(snapshot.usage_history.rows.is_empty());
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|item| item.contains("database is unavailable"))
+        );
     }
 }

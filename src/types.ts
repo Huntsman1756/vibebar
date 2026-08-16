@@ -7,7 +7,7 @@ export type AgentUsage = { agent: string; provider: string; model: string; sourc
 export type HistoryRange = "today" | "7d" | "30d" | "month";
 export type HistorySourceFidelity = "metadata" | "session-fallback" | "event-fallback" | "unknown";
 export type UsageHistoryRow = { day: string; repository: string; agent: string; provider: string; model: string; source: string; sourceFidelity: HistorySourceFidelity; messageCount: number; sessionCount: number; tokens: TokenUsage; costMicrousd: number | null };
-export type UsageHistory = { rows: UsageHistoryRow[]; oldestDay: string | null; newestDay: string | null; truncated: boolean; repositoryAttributionEnabled: boolean };
+export type UsageHistory = { available?: boolean; rows: UsageHistoryRow[]; oldestDay: string | null; newestDay: string | null; truncated: boolean; repositoryAttributionEnabled: boolean };
 export type HistorySummary = {
   billableTokens: number;
   cacheTokens: number;

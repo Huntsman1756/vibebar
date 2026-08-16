@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Days, Local, LocalResult, NaiveDate, TimeZone};
 use rusqlite::{Connection, OpenFlags};
@@ -17,6 +18,7 @@ const MESSAGE_SOURCE: &str = "opencode-db-messages-31d";
 const MESSAGE_FIDELITY: &str = "metadata";
 const SESSION_FALLBACK_SOURCE: &str = "opencode-db-session-31d-fallback";
 const SESSION_FALLBACK_FIDELITY: &str = "session-fallback";
+const OPENCODE_HISTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct MessageMetadataRecord {
     time_created: i64,
@@ -27,7 +29,7 @@ struct MessageMetadataRecord {
     output_tokens: i64,
     cache_read_tokens: i64,
     cache_write_tokens: i64,
-    cost_microusd: Option<f64>,
+    cost_dollars: Option<f64>,
     session_id: String,
     directory: String,
 }
@@ -91,6 +93,25 @@ impl Default for AgentUsageAccumulator {
 type HistoryKey = (String, String, String, String, String, String, String);
 type AgentKey = (String, String, String, String);
 
+pub(crate) struct OpenCodeUsageBundle {
+    pub(crate) history: UsageHistory,
+    pub(crate) agent_usage: Vec<AgentUsage>,
+    pub(crate) diagnostics: Vec<String>,
+}
+
+pub(crate) fn opencode_history_query_timeout() -> Duration {
+    OPENCODE_HISTORY_QUERY_TIMEOUT
+}
+
+pub(crate) fn collect_opencode_usage() -> Result<OpenCodeUsageBundle, String> {
+    let path = opencode_database_path().ok_or("OpenCode history database is unavailable")?;
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "OpenCode history database cannot be opened read-only".to_string())?;
+    let since_millis = local_history_window_start_millis();
+    let mut resolver = RepositoryResolver::new(true);
+    collect_usage_from_connection(&connection, since_millis, &mut resolver)
+}
+
 pub fn collect_opencode_history() -> Result<UsageHistory, String> {
     let path = opencode_database_path().ok_or("OpenCode history database is unavailable")?;
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -112,33 +133,13 @@ pub fn query_message_history(
     since_millis: i64,
     resolver: &mut RepositoryResolver,
 ) -> Result<UsageHistory, String> {
-    let mut grouped: BTreeMap<HistoryKey, HistoryAccumulator> = BTreeMap::new();
-    for record in query_message_records(connection, since_millis)? {
-        let key = (
-            local_day(record.time_created),
-            resolve_repository(&record.directory, resolver),
-            record.agent,
-            normalize_provider_id(&record.provider),
-            record.model,
-            MESSAGE_SOURCE.into(),
-            MESSAGE_FIDELITY.into(),
-        );
-        let entry = grouped.entry(key).or_default();
-        entry.message_count = entry.message_count.saturating_add(1);
-        entry.sessions.insert(record.session_id);
-        add_tokens(
-            &mut entry.tokens,
-            record.input_tokens,
-            record.output_tokens,
-            record.cache_read_tokens,
-            record.cache_write_tokens,
-        );
-        if let Some(cost) = record.cost_microusd.and_then(f64_to_u64) {
-            entry.cost_microusd = Some(entry.cost_microusd.unwrap_or(0).saturating_add(cost));
-        }
-    }
-
-    Ok(history_from_grouped_rows(grouped))
+    query_message_usage(
+        connection,
+        since_millis,
+        resolver,
+        Instant::now() + opencode_history_query_timeout(),
+    )
+    .map(|bundle| bundle.history)
 }
 
 pub fn query_session_history_fallback(
@@ -146,30 +147,36 @@ pub fn query_session_history_fallback(
     since_millis: i64,
     resolver: &mut RepositoryResolver,
 ) -> Result<UsageHistory, String> {
-    let mut grouped: BTreeMap<HistoryKey, HistoryAccumulator> = BTreeMap::new();
-    for record in query_session_records(connection, since_millis)? {
-        let (provider, model) = opencode_model_identity(&record.raw_model);
-        let key = (
-            local_day(record.time_updated),
-            resolve_repository(&record.directory, resolver),
-            record.agent,
-            provider,
-            model,
-            SESSION_FALLBACK_SOURCE.into(),
-            SESSION_FALLBACK_FIDELITY.into(),
-        );
-        let entry = grouped.entry(key).or_default();
-        entry.sessions.insert(record.session_id);
-        add_tokens(
-            &mut entry.tokens,
-            record.input_tokens,
-            record.output_tokens,
-            record.cache_read_tokens,
-            record.cache_write_tokens,
-        );
-    }
+    query_session_usage(
+        connection,
+        since_millis,
+        resolver,
+        Instant::now() + opencode_history_query_timeout(),
+    )
+    .map(|bundle| bundle.history)
+}
 
-    Ok(history_from_grouped_rows(grouped))
+fn collect_usage_from_connection(
+    connection: &Connection,
+    since_millis: i64,
+    resolver: &mut RepositoryResolver,
+) -> Result<OpenCodeUsageBundle, String> {
+    let deadline = Instant::now() + opencode_history_query_timeout();
+    match query_message_usage(connection, since_millis, resolver, deadline) {
+        Ok(bundle) => Ok(bundle),
+        Err(message_error) => {
+            ensure_query_within_budget(deadline)?;
+            let fallback = query_session_usage(connection, since_millis, resolver, deadline)
+                .map_err(|session_error| {
+                    format!("{message_error}; OpenCode session fallback failed: {session_error}")
+                })?;
+            if fallback.history.rows.is_empty() && fallback.agent_usage.is_empty() {
+                Err("OpenCode history database has no usage rows in the last 31 days".into())
+            } else {
+                Ok(fallback)
+            }
+        }
+    }
 }
 
 fn collect_history_from_connection(
@@ -208,9 +215,12 @@ fn collect_opencode_agents_from_connection(
 }
 
 pub fn merge_agent_usage_sources(
-    primary: Vec<AgentUsage>,
-    fallback: Vec<AgentUsage>,
+    mut primary: Vec<AgentUsage>,
+    mut fallback: Vec<AgentUsage>,
 ) -> Vec<AgentUsage> {
+    for item in primary.iter_mut().chain(fallback.iter_mut()) {
+        item.provider = normalize_provider_id(&item.provider);
+    }
     let owned_providers = primary
         .iter()
         .map(|item| item.provider.clone())
@@ -241,10 +251,13 @@ fn history_from_grouped_rows(grouped: BTreeMap<HistoryKey, HistoryAccumulator>) 
     }))
 }
 
-fn query_message_records(
+fn query_message_usage(
     connection: &Connection,
     since_millis: i64,
-) -> Result<Vec<MessageMetadataRecord>, String> {
+    resolver: &mut RepositoryResolver,
+    deadline: Instant,
+) -> Result<OpenCodeUsageBundle, String> {
+    ensure_query_within_budget(deadline)?;
     let mut statement = connection
         .prepare(
             "SELECT
@@ -265,33 +278,119 @@ fn query_message_records(
                AND json_extract(m.data, '$.role') = 'assistant'",
         )
         .map_err(|error| format!("OpenCode assistant metadata query failed: {error}"))?;
-
-    let rows = statement
-        .query_map([since_millis], |row| {
-            Ok(MessageMetadataRecord {
-                time_created: row.get(0)?,
-                agent: row.get(1)?,
-                model: row.get(2)?,
-                provider: row.get(3)?,
-                input_tokens: row.get(4)?,
-                output_tokens: row.get(5)?,
-                cache_read_tokens: row.get(6)?,
-                cache_write_tokens: row.get(7)?,
-                cost_microusd: row.get(8)?,
-                session_id: row.get(9)?,
-                directory: row.get(10)?,
-            })
-        })
+    let mut rows = statement
+        .query([since_millis])
         .map_err(|error| format!("OpenCode assistant metadata query failed: {error}"))?;
+    let mut history_grouped: BTreeMap<HistoryKey, HistoryAccumulator> = BTreeMap::new();
+    let mut agent_grouped: BTreeMap<AgentKey, AgentUsageAccumulator> = BTreeMap::new();
+    let mut invalid_timestamps = 0_u64;
 
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?
+    {
+        ensure_query_within_budget(deadline)?;
+        let record = MessageMetadataRecord {
+            time_created: row
+                .get(0)
+                .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
+            agent: row
+                .get(1)
+                .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
+            model: row
+                .get(2)
+                .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
+            provider: row
+                .get(3)
+                .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
+            input_tokens: row
+                .get(4)
+                .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
+            output_tokens: row
+                .get(5)
+                .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
+            cache_read_tokens: row
+                .get(6)
+                .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
+            cache_write_tokens: row
+                .get(7)
+                .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
+            cost_dollars: row
+                .get(8)
+                .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
+            session_id: row
+                .get(9)
+                .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
+            directory: row
+                .get(10)
+                .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
+        };
+        let Some(day) = local_day(record.time_created) else {
+            invalid_timestamps = invalid_timestamps.saturating_add(1);
+            continue;
+        };
+        let provider = normalize_provider_id(&record.provider);
+        let history_key = (
+            day,
+            resolve_repository(&record.directory, resolver),
+            record.agent.clone(),
+            provider.clone(),
+            record.model.clone(),
+            MESSAGE_SOURCE.into(),
+            MESSAGE_FIDELITY.into(),
+        );
+        let history_entry = history_grouped.entry(history_key).or_default();
+        history_entry.message_count = history_entry.message_count.saturating_add(1);
+        history_entry.sessions.insert(record.session_id.clone());
+        add_tokens(
+            &mut history_entry.tokens,
+            record.input_tokens,
+            record.output_tokens,
+            record.cache_read_tokens,
+            record.cache_write_tokens,
+        );
+        if let Some(cost) = record.cost_dollars.and_then(dollars_to_microusd) {
+            history_entry.cost_microusd = Some(
+                history_entry
+                    .cost_microusd
+                    .unwrap_or(0)
+                    .saturating_add(cost),
+            );
+        }
+
+        let agent_key = (record.agent, provider, record.model, MESSAGE_SOURCE.into());
+        let agent_entry = agent_grouped.entry(agent_key).or_default();
+        agent_entry.calls = agent_entry.calls.saturating_add(1);
+        agent_entry.sessions.insert(record.session_id);
+        add_tokens(
+            &mut agent_entry.tokens,
+            record.input_tokens,
+            record.output_tokens,
+            record.cache_read_tokens,
+            record.cache_write_tokens,
+        );
+    }
+
+    ensure_query_within_budget(deadline)?;
+    Ok(OpenCodeUsageBundle {
+        history: history_from_grouped_rows(history_grouped),
+        agent_usage: agent_usage_from_grouped(agent_grouped),
+        diagnostics: invalid_timestamp_diagnostic(
+            "OpenCode assistant metadata",
+            invalid_timestamps,
+        )
+        .into_iter()
+        .collect(),
+    })
 }
 
-fn query_session_records(
+fn query_session_usage(
     connection: &Connection,
     since_millis: i64,
-) -> Result<Vec<SessionAggregateRecord>, String> {
+    resolver: &mut RepositoryResolver,
+    deadline: Instant,
+) -> Result<OpenCodeUsageBundle, String> {
+    ensure_query_within_budget(deadline)?;
     let mut statement = connection
         .prepare(
             "SELECT
@@ -308,78 +407,127 @@ fn query_session_records(
              WHERE time_updated >= ?1",
         )
         .map_err(|error| format!("OpenCode session fallback query failed: {error}"))?;
-
-    let rows = statement
-        .query_map([since_millis], |row| {
-            Ok(SessionAggregateRecord {
-                time_updated: row.get(0)?,
-                session_id: row.get(1)?,
-                directory: row.get(2)?,
-                agent: row.get(3)?,
-                raw_model: row.get(4)?,
-                input_tokens: row.get(5)?,
-                output_tokens: row.get(6)?,
-                cache_read_tokens: row.get(7)?,
-                cache_write_tokens: row.get(8)?,
-            })
-        })
+    let mut rows = statement
+        .query([since_millis])
         .map_err(|error| format!("OpenCode session fallback query failed: {error}"))?;
+    let mut history_grouped: BTreeMap<HistoryKey, HistoryAccumulator> = BTreeMap::new();
+    let mut agent_grouped: BTreeMap<AgentKey, AgentUsageAccumulator> = BTreeMap::new();
+    let mut invalid_timestamps = 0_u64;
 
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("OpenCode session fallback row was invalid: {error}"))
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| format!("OpenCode session fallback row was invalid: {error}"))?
+    {
+        ensure_query_within_budget(deadline)?;
+        let record = SessionAggregateRecord {
+            time_updated: row
+                .get(0)
+                .map_err(|error| format!("OpenCode session fallback row was invalid: {error}"))?,
+            session_id: row
+                .get(1)
+                .map_err(|error| format!("OpenCode session fallback row was invalid: {error}"))?,
+            directory: row
+                .get(2)
+                .map_err(|error| format!("OpenCode session fallback row was invalid: {error}"))?,
+            agent: row
+                .get(3)
+                .map_err(|error| format!("OpenCode session fallback row was invalid: {error}"))?,
+            raw_model: row
+                .get(4)
+                .map_err(|error| format!("OpenCode session fallback row was invalid: {error}"))?,
+            input_tokens: row
+                .get(5)
+                .map_err(|error| format!("OpenCode session fallback row was invalid: {error}"))?,
+            output_tokens: row
+                .get(6)
+                .map_err(|error| format!("OpenCode session fallback row was invalid: {error}"))?,
+            cache_read_tokens: row
+                .get(7)
+                .map_err(|error| format!("OpenCode session fallback row was invalid: {error}"))?,
+            cache_write_tokens: row
+                .get(8)
+                .map_err(|error| format!("OpenCode session fallback row was invalid: {error}"))?,
+        };
+        let Some(day) = local_day(record.time_updated) else {
+            invalid_timestamps = invalid_timestamps.saturating_add(1);
+            continue;
+        };
+        let (provider, model) = opencode_model_identity(&record.raw_model);
+        let history_key = (
+            day,
+            resolve_repository(&record.directory, resolver),
+            record.agent.clone(),
+            provider.clone(),
+            model.clone(),
+            SESSION_FALLBACK_SOURCE.into(),
+            SESSION_FALLBACK_FIDELITY.into(),
+        );
+        let history_entry = history_grouped.entry(history_key).or_default();
+        history_entry.sessions.insert(record.session_id.clone());
+        add_tokens(
+            &mut history_entry.tokens,
+            record.input_tokens,
+            record.output_tokens,
+            record.cache_read_tokens,
+            record.cache_write_tokens,
+        );
+        let agent_key = (
+            record.agent,
+            provider,
+            model,
+            SESSION_FALLBACK_SOURCE.into(),
+        );
+        let agent_entry = agent_grouped.entry(agent_key).or_default();
+        agent_entry.calls = agent_entry.calls.saturating_add(1);
+        agent_entry.sessions.insert(record.session_id);
+        add_tokens(
+            &mut agent_entry.tokens,
+            record.input_tokens,
+            record.output_tokens,
+            record.cache_read_tokens,
+            record.cache_write_tokens,
+        );
+    }
+
+    ensure_query_within_budget(deadline)?;
+    Ok(OpenCodeUsageBundle {
+        history: history_from_grouped_rows(history_grouped),
+        agent_usage: agent_usage_from_grouped(agent_grouped),
+        diagnostics: invalid_timestamp_diagnostic(
+            "OpenCode session fallback",
+            invalid_timestamps,
+        )
+        .into_iter()
+        .collect(),
+    })
 }
 
 fn query_message_agent_usage(
     connection: &Connection,
     since_millis: i64,
 ) -> Result<Vec<AgentUsage>, String> {
-    let mut grouped: BTreeMap<AgentKey, AgentUsageAccumulator> = BTreeMap::new();
-    for record in query_message_records(connection, since_millis)? {
-        let key = (
-            record.agent,
-            normalize_provider_id(&record.provider),
-            record.model,
-            MESSAGE_SOURCE.into(),
-        );
-        let entry = grouped.entry(key).or_default();
-        entry.calls = entry.calls.saturating_add(1);
-        entry.sessions.insert(record.session_id);
-        add_tokens(
-            &mut entry.tokens,
-            record.input_tokens,
-            record.output_tokens,
-            record.cache_read_tokens,
-            record.cache_write_tokens,
-        );
-    }
-    Ok(agent_usage_from_grouped(grouped))
+    let mut resolver = RepositoryResolver::new(false);
+    query_message_usage(
+        connection,
+        since_millis,
+        &mut resolver,
+        Instant::now() + opencode_history_query_timeout(),
+    )
+    .map(|bundle| bundle.agent_usage)
 }
 
 fn query_session_agent_usage_fallback(
     connection: &Connection,
     since_millis: i64,
 ) -> Result<Vec<AgentUsage>, String> {
-    let mut grouped: BTreeMap<AgentKey, AgentUsageAccumulator> = BTreeMap::new();
-    for record in query_session_records(connection, since_millis)? {
-        let (provider, model) = opencode_model_identity(&record.raw_model);
-        let key = (
-            record.agent,
-            provider,
-            model,
-            SESSION_FALLBACK_SOURCE.into(),
-        );
-        let entry = grouped.entry(key).or_default();
-        entry.calls = entry.calls.saturating_add(1);
-        entry.sessions.insert(record.session_id);
-        add_tokens(
-            &mut entry.tokens,
-            record.input_tokens,
-            record.output_tokens,
-            record.cache_read_tokens,
-            record.cache_write_tokens,
-        );
-    }
-    Ok(agent_usage_from_grouped(grouped))
+    let mut resolver = RepositoryResolver::new(false);
+    query_session_usage(
+        connection,
+        since_millis,
+        &mut resolver,
+        Instant::now() + opencode_history_query_timeout(),
+    )
+    .map(|bundle| bundle.agent_usage)
 }
 
 fn agent_usage_from_grouped(grouped: BTreeMap<AgentKey, AgentUsageAccumulator>) -> Vec<AgentUsage> {
@@ -455,9 +603,32 @@ fn non_negative(value: i64) -> u64 {
     value.max(0) as u64
 }
 
-fn f64_to_u64(value: f64) -> Option<u64> {
+fn ensure_query_within_budget(deadline: Instant) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        Err(format!(
+            "OpenCode history query exceeded the {}-second time budget",
+            opencode_history_query_timeout().as_secs()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn invalid_timestamp_diagnostic(source: &str, count: u64) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some(format!(
+            "Skipped 1 {source} row with an invalid timestamp."
+        )),
+        _ => Some(format!(
+            "Skipped {count} {source} rows with invalid timestamps."
+        )),
+    }
+}
+
+fn dollars_to_microusd(value: f64) -> Option<u64> {
     if value.is_finite() && value >= 0.0 {
-        Some(value.round().clamp(0.0, u64::MAX as f64) as u64)
+        Some((value * 1_000_000.0).round().clamp(0.0, u64::MAX as f64) as u64)
     } else {
         None
     }
@@ -481,7 +652,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use chrono::{Local, TimeZone};
@@ -491,8 +662,8 @@ mod tests {
     use super::{
         MESSAGE_FIDELITY, MESSAGE_SOURCE, SESSION_FALLBACK_FIDELITY, SESSION_FALLBACK_SOURCE,
         collect_history_from_connection, collect_opencode_agents_from_connection,
-        local_history_window_start_millis_for, merge_agent_usage_sources, query_message_history,
-        query_session_history_fallback,
+        collect_usage_from_connection, local_history_window_start_millis_for,
+        merge_agent_usage_sources, query_message_history, query_session_history_fallback,
     };
     use crate::{
         domain::{AgentUsage, TokenUsage},
@@ -830,7 +1001,7 @@ mod tests {
         assert_eq!(nan_executor.tokens.cache_write_tokens, 6);
         assert_eq!(nan_executor.tokens.billable(), 170);
         assert_eq!(nan_executor.tokens.cache(), 18);
-        assert_eq!(nan_executor.cost_microusd, Some(10));
+        assert_eq!(nan_executor.cost_microusd, Some(10_000_000));
         assert_eq!(nan_executor.source, MESSAGE_SOURCE);
         assert_eq!(nan_executor.source_fidelity, MESSAGE_FIDELITY);
 
@@ -1155,6 +1326,140 @@ mod tests {
             local_history_window_start_millis_for(now),
             local_timestamp(2026, 7, 17, 0)
         );
+    }
+
+    #[test]
+    fn combined_message_query_builds_history_and_agents_with_micro_usd_cost() {
+        let repo_root = TestDir::new("combined");
+        let repo = create_repo(
+            repo_root.path(),
+            "alpha",
+            "https://github.com/example/alpha.git",
+        );
+        let connection = Connection::open_in_memory().unwrap();
+        create_history_schema(&connection);
+        let timestamp = local_timestamp(2026, 8, 16, 12);
+        insert_session(
+            &connection,
+            "s1",
+            &repo,
+            "executor",
+            r#"{"id":"qwen3.6","providerID":"nan"}"#,
+            timestamp,
+        );
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                (
+                    "m1",
+                    "s1",
+                    timestamp,
+                    json!({
+                        "role": "assistant",
+                        "agent": "executor",
+                        "modelID": "qwen3.6",
+                        "providerID": " NaN ",
+                        "tokens": { "input": 10, "output": 2 },
+                        "cost": 0.123456
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+
+        let mut resolver = RepositoryResolver::new(true);
+        let bundle = collect_usage_from_connection(
+            &connection,
+            local_timestamp(2026, 8, 15, 0),
+            &mut resolver,
+        )
+        .unwrap();
+
+        assert_eq!(bundle.history.rows.len(), 1);
+        assert_eq!(bundle.history.rows[0].cost_microusd, Some(123_456));
+        assert_eq!(bundle.agent_usage.len(), 1);
+        assert_eq!(bundle.agent_usage[0].provider, "nan");
+        assert_eq!(bundle.agent_usage[0].tokens.billable(), 12);
+    }
+
+    #[test]
+    fn invalid_message_timestamp_is_skipped_and_reported_without_poisoning_usage() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_history_schema(&connection);
+        insert_session(
+            &connection,
+            "s1",
+            Path::new("/tmp/not-a-real-repository"),
+            "executor",
+            r#"{"id":"qwen3.6","providerID":"nan"}"#,
+            i64::MAX,
+        );
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                (
+                    "m1",
+                    "s1",
+                    i64::MAX,
+                    json!({
+                        "role": "assistant",
+                        "agent": "executor",
+                        "modelID": "qwen3.6",
+                        "providerID": "nan",
+                        "tokens": { "input": 10, "output": 2 }
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+
+        let mut resolver = RepositoryResolver::new(true);
+        let bundle = collect_usage_from_connection(
+            &connection,
+            local_timestamp(2026, 8, 15, 0),
+            &mut resolver,
+        )
+        .unwrap();
+
+        assert!(bundle.history.rows.is_empty());
+        assert!(bundle.agent_usage.is_empty());
+        assert_eq!(
+            bundle.diagnostics,
+            ["Skipped 1 OpenCode assistant metadata row with an invalid timestamp."]
+        );
+    }
+
+    #[test]
+    fn expired_history_query_budget_is_reported() {
+        assert!(
+            super::ensure_query_within_budget(Instant::now() - Duration::from_millis(1)).is_err()
+        );
+    }
+
+    #[test]
+    fn agent_provider_ownership_normalizes_case_and_whitespace() {
+        let agent = |provider: &str, source: &str| AgentUsage {
+            agent: "executor".into(),
+            provider: provider.into(),
+            model: "qwen3.6".into(),
+            source: source.into(),
+            calls: 1,
+            tasks: 1,
+            tokens: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        };
+
+        let merged = merge_agent_usage_sources(
+            vec![agent(" NaN ", MESSAGE_SOURCE)],
+            vec![agent("nan", "vibebar-events-30d")],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].provider, "nan");
     }
 
     #[test]

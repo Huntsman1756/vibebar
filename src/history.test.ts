@@ -6,6 +6,7 @@ import {
   aggregateHistoryByProviderTotals,
   aggregateHistoryByRepository,
   buildProviderToneMap,
+  isHistoryUnavailable,
   historyStart,
   sanitizeRepositoryIdentifier,
   selectHistoryRows,
@@ -208,11 +209,34 @@ describe("aggregateHistoryByProviderTotals", () => {
     const tones = buildProviderToneMap(aggregateHistoryByProviderTotals(selectHistoryRows(rows, "30d", "2026-08-16")), ["mint", "violet", "amber", "slate"]);
 
     expect([...tones.entries()]).toEqual([
-      ["nan", "mint"],
-      ["aaa-provider", "violet"],
-      ["bbb-provider", "amber"],
+      ["aaa-provider", "mint"],
+      ["bbb-provider", "violet"],
+      ["nan", "amber"],
       ["opencode-go", "slate"],
     ]);
+  });
+
+  it("keeps provider tones stable when the selected range reorders providers", () => {
+    const allRows = aggregateHistoryByProviderTotals(selectHistoryRows(rows, "30d", "2026-08-16"));
+    const todayRows = aggregateHistoryByProviderTotals(selectHistoryRows(rows, "today", "2026-08-16"));
+    const allTones = buildProviderToneMap(allRows, ["mint", "violet", "amber", "slate"]);
+    const todayTones = buildProviderToneMap(todayRows, ["mint", "violet", "amber", "slate"]);
+    const reorderedTones = buildProviderToneMap([...allRows].reverse(), ["mint", "violet", "amber", "slate"]);
+
+    expect(todayTones.get("aaa-provider")).toBe(allTones.get("aaa-provider"));
+    expect(todayTones.get("bbb-provider")).toBe(allTones.get("bbb-provider"));
+    expect(todayTones.get("nan")).toBe(allTones.get("nan"));
+    expect([...reorderedTones.entries()]).toEqual([...allTones.entries()]);
+  });
+});
+
+describe("history availability", () => {
+  it("distinguishes an explicit unavailable history from a successful empty history", () => {
+    const unavailable = { rows: [], oldestDay: null, newestDay: null, truncated: false, repositoryAttributionEnabled: false, available: false };
+    const empty = { ...unavailable, available: true };
+
+    expect(isHistoryUnavailable(unavailable)).toBe(true);
+    expect(isHistoryUnavailable(empty)).toBe(false);
   });
 });
 

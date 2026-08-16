@@ -12,14 +12,15 @@ pub enum HistoryRange {
     ThisMonth,
 }
 
-pub fn local_day(timestamp_millis: i64) -> String {
-    Utc.timestamp_millis_opt(timestamp_millis)
-        .single()
-        .expect("timestamp millis should be valid")
-        .with_timezone(&Local)
-        .date_naive()
-        .format("%F")
-        .to_string()
+pub fn local_day(timestamp_millis: i64) -> Option<String> {
+    Some(
+        Utc.timestamp_millis_opt(timestamp_millis)
+            .single()?
+            .with_timezone(&Local)
+            .date_naive()
+            .format("%F")
+            .to_string(),
+    )
 }
 
 #[allow(
@@ -67,6 +68,14 @@ mod tests {
             .single()
             .unwrap();
 
-        assert_eq!(local_day(local_noon.timestamp_millis()), "2026-08-16");
+        assert_eq!(
+            local_day(local_noon.timestamp_millis()).as_deref(),
+            Some("2026-08-16")
+        );
+    }
+
+    #[test]
+    fn invalid_timestamp_returns_no_local_day_instead_of_panicking() {
+        assert_eq!(local_day(i64::MAX), None);
     }
 }

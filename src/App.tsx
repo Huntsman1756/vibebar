@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "./App.css";
-import { POPOVER_OPENED_EVENT, shouldAutoRefreshOnMount } from "./appRuntime";
+import { POPOVER_OPENED_EVENT, shouldAutoRefreshOnMount, shouldUseDemoFallback } from "./appRuntime";
 import { demoSnapshot } from "./demo";
 import {
   aggregateHistoryByAgent,
@@ -10,6 +10,7 @@ import {
   aggregateHistoryByProviderTotals,
   aggregateHistoryByRepository,
   buildProviderToneMap,
+  isHistoryUnavailable,
   sanitizeRepositoryIdentifier,
   selectHistoryRows,
 } from "./history";
@@ -337,11 +338,14 @@ function HistoryPanel({ snapshot, providerLabels, range, onRangeChange }: { snap
   const totals = useMemo(() => summarizeHistoryRows(rows), [rows]);
   const providers = useMemo(() => aggregateHistoryByProvider(rows), [rows]);
   const providerTotals = useMemo(() => aggregateHistoryByProviderTotals(rows), [rows]);
-  const providerTones = useMemo(() => buildProviderToneMap(providerTotals, historyBarTones), [providerTotals]);
+  const providerTones = useMemo(
+    () => buildProviderToneMap(aggregateHistoryByProviderTotals(history?.rows ?? []), historyBarTones),
+    [history],
+  );
   const repositories = useMemo(() => aggregateHistoryByRepository(rows), [rows]);
   const agents = useMemo(() => aggregateHistoryByAgent(rows), [rows]);
   const hasSessionFallback = useMemo(() => rows.some((row) => row.sourceFidelity === "session-fallback"), [rows]);
-  const unavailable = Boolean(history && history.rows.length === 0 && !history.oldestDay && !history.newestDay);
+  const unavailable = Boolean(history && isHistoryUnavailable(history));
   const empty = Boolean(history && !unavailable && rows.length === 0);
 
   return <section className="history-panel">
@@ -381,7 +385,7 @@ function CompactHistorySummary({ snapshot, providerLabels, range, onRangeChange 
   const providers = useMemo(() => aggregateHistoryByProviderTotals(rows).slice(0, 3), [rows]);
   const repositories = useMemo(() => aggregateHistoryByRepository(rows).slice(0, 3), [rows]);
   const hasSessionFallback = rows.some((row) => row.sourceFidelity === "session-fallback");
-  const unavailable = Boolean(history && history.rows.length === 0 && !history.oldestDay && !history.newestDay);
+  const unavailable = Boolean(history && isHistoryUnavailable(history));
   const empty = Boolean(history && !unavailable && rows.length === 0);
 
   return <section className="compact-history">
@@ -445,6 +449,7 @@ function Metric({ label, value, detail, tone }: { label: string; value: string; 
 
 function App() {
   const isPopover = new URLSearchParams(window.location.search).get("view") === "popover";
+  const tauriRuntime = isTauri();
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [preview, setPreview] = useState(false);
@@ -458,13 +463,18 @@ function App() {
       setPreview(false);
       setError(null);
     } catch (reason) {
-      setSnapshot(demoSnapshot);
-      setPreview(true);
+      if (shouldUseDemoFallback(tauriRuntime)) {
+        setSnapshot(demoSnapshot);
+        setPreview(true);
+      } else {
+        setSnapshot(null);
+        setPreview(false);
+      }
       setError(String(reason));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [tauriRuntime]);
 
   useEffect(() => {
     if (!shouldAutoRefreshOnMount(isPopover)) {
@@ -534,6 +544,7 @@ function App() {
     </section>
 
     {preview ? <div className="notice"><strong>Browser preview</strong><span>Showing sample data. Live collectors run inside the Tauri app.</span>{error ? <code>{error}</code> : null}</div> : null}
+    {!preview && error ? <div className="notice"><strong>Live snapshot unavailable</strong><span>VibeBar could not read the local collectors, so it is not showing invented provider or history values.</span><code>{error}</code></div> : null}
 
     <section className="section-head"><div><p className="eyebrow">LIVE SOURCES</p><h2>Capacity</h2></div><span>Updated {snapshot ? new Date(snapshot.generatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—"}</span></section>
     <section className="provider-grid">{providers.map((provider) => <ProviderCard key={provider.id} provider={provider} />)}{!snapshot && <div className="provider-card skeleton" />}</section>

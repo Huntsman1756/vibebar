@@ -186,15 +186,34 @@ pub struct UsageHistoryRow {
     pub cost_microusd: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageHistory {
+    #[serde(default = "default_usage_history_available")]
+    pub available: bool,
     #[serde(default)]
     pub rows: Vec<UsageHistoryRow>,
     pub oldest_day: Option<String>,
     pub newest_day: Option<String>,
     pub truncated: bool,
     pub repository_attribution_enabled: bool,
+}
+
+fn default_usage_history_available() -> bool {
+    true
+}
+
+impl Default for UsageHistory {
+    fn default() -> Self {
+        Self {
+            available: true,
+            rows: Vec::new(),
+            oldest_day: None,
+            newest_day: None,
+            truncated: false,
+            repository_attribution_enabled: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -454,6 +473,7 @@ pub fn aggregate_history_rows(rows: impl IntoIterator<Item = UsageHistoryRow>) -
     }
 
     UsageHistory {
+        available: true,
         rows,
         oldest_day,
         newest_day,
@@ -852,14 +872,37 @@ mod tests {
     }
 
     #[test]
-    fn usage_history_defaults_to_disabled_empty_state() {
+    fn usage_history_defaults_to_available_empty_state() {
         let history = UsageHistory::default();
 
+        assert!(history.available);
         assert!(history.rows.is_empty());
         assert_eq!(history.oldest_day, None);
         assert_eq!(history.newest_day, None);
         assert!(!history.truncated);
         assert!(!history.repository_attribution_enabled);
+    }
+
+    #[test]
+    fn aggregated_history_is_available_even_when_the_result_is_empty() {
+        let history = aggregate_history_rows(std::iter::empty());
+
+        assert!(history.available);
+        assert!(history.rows.is_empty());
+    }
+
+    #[test]
+    fn usage_history_without_availability_field_defaults_to_available_for_older_payloads() {
+        let history = serde_json::from_value::<UsageHistory>(serde_json::json!({
+            "rows": [],
+            "oldestDay": null,
+            "newestDay": null,
+            "truncated": false,
+            "repositoryAttributionEnabled": false
+        }))
+        .unwrap();
+
+        assert!(history.available);
     }
 
     #[test]
