@@ -9,8 +9,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chrono::Utc;
-use domain::{DashboardSnapshot, RecentEvent, UsageEvent, aggregate_workflow};
+use chrono::{Duration, Utc};
+use domain::{
+    DashboardSnapshot, RecentEvent, UsageEvent, aggregate_agent_usage, aggregate_workflow,
+};
 use tauri::{
     Manager, State,
     menu::{Menu, MenuItem},
@@ -23,6 +25,7 @@ struct AppState {
 }
 
 fn build_snapshot(data_dir: &std::path::Path) -> DashboardSnapshot {
+    let now = Utc::now();
     let (events, mut diagnostics) = storage::read_events(data_dir);
     let mut providers = match collectors::collect_opencode() {
         Ok(providers) => providers,
@@ -65,13 +68,27 @@ fn build_snapshot(data_dir: &std::path::Path) -> DashboardSnapshot {
         })
         .collect();
     DashboardSnapshot {
-        generated_at: Utc::now().to_rfc3339(),
+        generated_at: now.to_rfc3339(),
         telemetry_path: storage::telemetry_path(data_dir).display().to_string(),
         providers,
+        agent_usage: aggregate_agent_usage(&events, now - Duration::days(30)),
         workflow: aggregate_workflow(&events),
         recent_events,
         diagnostics,
     }
+}
+
+#[tauri::command]
+fn open_full_dashboard(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(popover) = app.get_webview_window("popover") {
+        popover.hide().map_err(|_| "cannot hide popover")?;
+    }
+    let main = app
+        .get_webview_window("main")
+        .ok_or("main window unavailable")?;
+    main.show().map_err(|_| "cannot show main window")?;
+    main.set_focus()
+        .map_err(|_| "cannot focus main window".to_string())
 }
 
 #[tauri::command]
@@ -146,7 +163,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             dashboard_snapshot,
             ingest_events,
-            telemetry_path
+            telemetry_path,
+            open_full_dashboard
         ])
         .run(tauri::generate_context!())
         .expect("error while running VibeBar");
