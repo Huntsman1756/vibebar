@@ -111,14 +111,13 @@ fn resolve_git_config_path(project_dir: &Path) -> Option<PathBuf> {
 
     if dot_git.is_file() {
         let git_dir = read_git_dir_reference(&dot_git, project_dir)?;
-        let common_dir = read_common_dir(&git_dir);
-        let common_config = common_dir.as_ref().unwrap_or(&git_dir).join("config");
-        if common_config.is_file() {
-            return Some(common_config);
-        }
-        let worktree_config = git_dir.join("config");
-        if worktree_config.is_file() {
-            return Some(worktree_config);
+        let git_dir = canonicalize_existing(git_dir)?;
+        let common_dir = canonicalize_existing(read_common_dir(&git_dir)?)?;
+        if is_safe_worktree_gitdir(&git_dir, &common_dir) {
+            let common_config = common_dir.join("config");
+            if common_config.is_file() {
+                return Some(common_config);
+            }
         }
     }
 
@@ -155,6 +154,20 @@ fn read_common_dir(git_dir: &Path) -> Option<PathBuf> {
     } else {
         git_dir.join(path)
     })
+}
+
+fn canonicalize_existing(path: PathBuf) -> Option<PathBuf> {
+    std::fs::canonicalize(path).ok()
+}
+
+fn is_safe_worktree_gitdir(git_dir: &Path, common_dir: &Path) -> bool {
+    common_dir.file_name().and_then(|name| name.to_str()) == Some(".git")
+        && git_dir.starts_with(common_dir)
+        && git_dir
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("worktrees")
 }
 
 fn read_origin_remote(config_path: &Path) -> Option<String> {
@@ -252,12 +265,12 @@ fn normalize_host_path(host: &str, path: &str) -> Option<String> {
     }
 
     let normalized_path = if let Some(last) = segments.last() {
-        if last.ends_with(".git") && last.len() > 4 {
+        if let Some(stripped) = last.strip_suffix(".git") {
             let mut normalized = segments[..segments.len() - 1].join("/");
             if !normalized.is_empty() {
                 normalized.push('/');
             }
-            normalized.push_str(last.trim_end_matches(".git"));
+            normalized.push_str(stripped);
             normalized
         } else if last == &".git" {
             return None;
@@ -321,6 +334,10 @@ mod tests {
         assert_eq!(
             normalize_remote_url("git@github.com:Acme/Private.git"),
             Some("github.com/Acme/Private".into())
+        );
+        assert_eq!(
+            normalize_remote_url("git@github.com:Acme/Private.git.git"),
+            Some("github.com/Acme/Private.git".into())
         );
         assert_eq!(
             normalize_remote_url("https://github.com/Acme/Private.git"),
@@ -427,6 +444,34 @@ mod tests {
             resolver.resolve(&worktree_dir),
             Some("gitlab.example/team/tool".into())
         );
+    }
+
+    #[test]
+    fn rejects_unsafe_worktree_pointer_to_unrelated_config() {
+        let unrelated_root = unique_dir("repository-resolver-unrelated");
+        let unrelated_git_dir = unrelated_root.join("outside");
+        let unrelated_common_dir = unrelated_root.join("metadata");
+        fs::create_dir_all(&unrelated_git_dir).expect("create unrelated git dir");
+        fs::create_dir_all(&unrelated_common_dir).expect("create unrelated common dir");
+        fs::write(unrelated_git_dir.join("commondir"), "../metadata").expect("write commondir");
+        fs::write(
+            unrelated_common_dir.join("config"),
+            r#"[remote "origin"]
+	url = https://example.invalid/unsafe/target.git
+"#,
+        )
+        .expect("write unrelated config");
+
+        let repo_dir = unique_dir("repository-resolver-unsafe-pointer");
+        fs::create_dir_all(&repo_dir).expect("create repo dir");
+        fs::write(
+            repo_dir.join(".git"),
+            format!("gitdir: {}\n", unrelated_git_dir.display()),
+        )
+        .expect("write gitfile");
+
+        let resolver = RepositoryResolver::new(true);
+        assert_eq!(resolver.resolve(&repo_dir), None);
     }
 
     #[test]
