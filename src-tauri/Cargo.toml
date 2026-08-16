@@ -23,7 +23,7 @@ tauri = { version = "2", features = ["tray-icon"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 regex = "1"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wait-timeout = "0.2"

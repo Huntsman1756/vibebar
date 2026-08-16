@@ -442,6 +442,8 @@ Expected: no private-data matches and no whitespace errors. Commit with `docs: d
 
 ### Task 8: Full verification, macOS QA, and publish
 
+**Status:** Packaged macOS QA is still pending because the host was locked; it has not passed.
+
 **Files:**
 - Modify only files required by verification fixes.
 - Build artifact: `/Applications/VibeBar.app` (local installation only; never commit it).

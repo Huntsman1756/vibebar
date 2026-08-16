@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Days, Local, LocalResult, NaiveDate, TimeZone};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::collectors::{opencode_database_path, opencode_model_identity};
 use crate::domain::{
@@ -19,6 +19,36 @@ const MESSAGE_FIDELITY: &str = "metadata";
 const SESSION_FALLBACK_SOURCE: &str = "opencode-db-session-31d-fallback";
 const SESSION_FALLBACK_FIDELITY: &str = "session-fallback";
 const OPENCODE_HISTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+const OPENCODE_HISTORY_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+const OPENCODE_HISTORY_PROGRESS_OPS: i32 = 1_000;
+
+struct QueryBudgetGuard<'connection> {
+    connection: &'connection Connection,
+}
+
+impl<'connection> QueryBudgetGuard<'connection> {
+    fn install(connection: &'connection Connection, deadline: Instant) -> Result<Self, String> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(query_budget_error)?;
+        connection
+            .busy_timeout(remaining.min(OPENCODE_HISTORY_BUSY_TIMEOUT))
+            .map_err(|error| {
+                format!("OpenCode history query timeout configuration failed: {error}")
+            })?;
+        connection.progress_handler(
+            OPENCODE_HISTORY_PROGRESS_OPS,
+            Some(move || Instant::now() >= deadline),
+        );
+        Ok(Self { connection })
+    }
+}
+
+impl Drop for QueryBudgetGuard<'_> {
+    fn drop(&mut self) {
+        self.connection.progress_handler(0, None::<fn() -> bool>);
+    }
+}
 
 struct MessageMetadataRecord {
     time_created: i64,
@@ -133,13 +163,10 @@ pub fn query_message_history(
     since_millis: i64,
     resolver: &mut RepositoryResolver,
 ) -> Result<UsageHistory, String> {
-    query_message_usage(
-        connection,
-        since_millis,
-        resolver,
-        Instant::now() + opencode_history_query_timeout(),
-    )
-    .map(|bundle| bundle.history)
+    with_query_budget(connection, |deadline| {
+        query_message_usage(connection, since_millis, resolver, deadline)
+            .map(|bundle| bundle.history)
+    })
 }
 
 pub fn query_session_history_fallback(
@@ -147,13 +174,10 @@ pub fn query_session_history_fallback(
     since_millis: i64,
     resolver: &mut RepositoryResolver,
 ) -> Result<UsageHistory, String> {
-    query_session_usage(
-        connection,
-        since_millis,
-        resolver,
-        Instant::now() + opencode_history_query_timeout(),
-    )
-    .map(|bundle| bundle.history)
+    with_query_budget(connection, |deadline| {
+        query_session_usage(connection, since_millis, resolver, deadline)
+            .map(|bundle| bundle.history)
+    })
 }
 
 fn collect_usage_from_connection(
@@ -161,22 +185,25 @@ fn collect_usage_from_connection(
     since_millis: i64,
     resolver: &mut RepositoryResolver,
 ) -> Result<OpenCodeUsageBundle, String> {
-    let deadline = Instant::now() + opencode_history_query_timeout();
-    match query_message_usage(connection, since_millis, resolver, deadline) {
-        Ok(bundle) => Ok(bundle),
-        Err(message_error) => {
-            ensure_query_within_budget(deadline)?;
-            let fallback = query_session_usage(connection, since_millis, resolver, deadline)
-                .map_err(|session_error| {
-                    format!("{message_error}; OpenCode session fallback failed: {session_error}")
-                })?;
-            if fallback.history.rows.is_empty() && fallback.agent_usage.is_empty() {
-                Err("OpenCode history database has no usage rows in the last 31 days".into())
-            } else {
-                Ok(fallback)
+    with_query_budget(connection, |deadline| {
+        match query_message_usage(connection, since_millis, resolver, deadline) {
+            Ok(bundle) => Ok(bundle),
+            Err(message_error) => {
+                ensure_query_within_budget(deadline)?;
+                let fallback = query_session_usage(connection, since_millis, resolver, deadline)
+                    .map_err(|session_error| {
+                        format!(
+                            "{message_error}; OpenCode session fallback failed: {session_error}"
+                        )
+                    })?;
+                if fallback.history.rows.is_empty() && fallback.agent_usage.is_empty() {
+                    Err("OpenCode history database has no usage rows in the last 31 days".into())
+                } else {
+                    Ok(fallback)
+                }
             }
         }
-    }
+    })
 }
 
 fn collect_history_from_connection(
@@ -184,34 +211,42 @@ fn collect_history_from_connection(
     since_millis: i64,
     resolver: &mut RepositoryResolver,
 ) -> Result<UsageHistory, String> {
-    match query_message_history(connection, since_millis, resolver) {
-        Ok(history) => Ok(history),
-        Err(_) => {
-            let fallback = query_session_history_fallback(connection, since_millis, resolver)?;
-            if fallback.rows.is_empty() {
-                Err("OpenCode history database has no usage rows in the last 31 days".into())
-            } else {
-                Ok(fallback)
+    with_query_budget(connection, |deadline| {
+        match query_message_usage(connection, since_millis, resolver, deadline) {
+            Ok(bundle) => Ok(bundle.history),
+            Err(_) => {
+                ensure_query_within_budget(deadline)?;
+                let fallback =
+                    query_session_usage(connection, since_millis, resolver, deadline)?.history;
+                if fallback.rows.is_empty() {
+                    Err("OpenCode history database has no usage rows in the last 31 days".into())
+                } else {
+                    Ok(fallback)
+                }
             }
         }
-    }
+    })
 }
 
 fn collect_opencode_agents_from_connection(
     connection: &Connection,
     since_millis: i64,
 ) -> Result<Vec<AgentUsage>, String> {
-    match query_message_agent_usage(connection, since_millis) {
-        Ok(usage) => Ok(usage),
-        Err(_) => {
-            let fallback = query_session_agent_usage_fallback(connection, since_millis)?;
-            if fallback.is_empty() {
-                Err("OpenCode history database has no agent usage in the last 31 days".into())
-            } else {
-                Ok(fallback)
+    with_query_budget(connection, |deadline| {
+        match query_message_agent_usage(connection, since_millis, deadline) {
+            Ok(usage) => Ok(usage),
+            Err(_) => {
+                ensure_query_within_budget(deadline)?;
+                let fallback =
+                    query_session_agent_usage_fallback(connection, since_millis, deadline)?;
+                if fallback.is_empty() {
+                    Err("OpenCode history database has no agent usage in the last 31 days".into())
+                } else {
+                    Ok(fallback)
+                }
             }
         }
-    }
+    })
 }
 
 pub fn merge_agent_usage_sources(
@@ -277,17 +312,19 @@ fn query_message_usage(
              WHERE m.time_created >= ?1
                AND json_extract(m.data, '$.role') = 'assistant'",
         )
-        .map_err(|error| format!("OpenCode assistant metadata query failed: {error}"))?;
+        .map_err(|error| {
+            sqlite_query_error("OpenCode assistant metadata query failed", error)
+        })?;
     let mut rows = statement
         .query([since_millis])
-        .map_err(|error| format!("OpenCode assistant metadata query failed: {error}"))?;
+        .map_err(|error| sqlite_query_error("OpenCode assistant metadata query failed", error))?;
     let mut history_grouped: BTreeMap<HistoryKey, HistoryAccumulator> = BTreeMap::new();
     let mut agent_grouped: BTreeMap<AgentKey, AgentUsageAccumulator> = BTreeMap::new();
     let mut invalid_timestamps = 0_u64;
 
     while let Some(row) = rows
         .next()
-        .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?
+        .map_err(|error| sqlite_query_error("OpenCode assistant metadata row was invalid", error))?
     {
         ensure_query_within_budget(deadline)?;
         let record = MessageMetadataRecord {
@@ -406,17 +443,17 @@ fn query_session_usage(
              FROM session
              WHERE time_updated >= ?1",
         )
-        .map_err(|error| format!("OpenCode session fallback query failed: {error}"))?;
+        .map_err(|error| sqlite_query_error("OpenCode session fallback query failed", error))?;
     let mut rows = statement
         .query([since_millis])
-        .map_err(|error| format!("OpenCode session fallback query failed: {error}"))?;
+        .map_err(|error| sqlite_query_error("OpenCode session fallback query failed", error))?;
     let mut history_grouped: BTreeMap<HistoryKey, HistoryAccumulator> = BTreeMap::new();
     let mut agent_grouped: BTreeMap<AgentKey, AgentUsageAccumulator> = BTreeMap::new();
     let mut invalid_timestamps = 0_u64;
 
     while let Some(row) = rows
         .next()
-        .map_err(|error| format!("OpenCode session fallback row was invalid: {error}"))?
+        .map_err(|error| sqlite_query_error("OpenCode session fallback row was invalid", error))?
     {
         ensure_query_within_budget(deadline)?;
         let record = SessionAggregateRecord {
@@ -493,41 +530,30 @@ fn query_session_usage(
     Ok(OpenCodeUsageBundle {
         history: history_from_grouped_rows(history_grouped),
         agent_usage: agent_usage_from_grouped(agent_grouped),
-        diagnostics: invalid_timestamp_diagnostic(
-            "OpenCode session fallback",
-            invalid_timestamps,
-        )
-        .into_iter()
-        .collect(),
+        diagnostics: invalid_timestamp_diagnostic("OpenCode session fallback", invalid_timestamps)
+            .into_iter()
+            .collect(),
     })
 }
 
 fn query_message_agent_usage(
     connection: &Connection,
     since_millis: i64,
+    deadline: Instant,
 ) -> Result<Vec<AgentUsage>, String> {
     let mut resolver = RepositoryResolver::new(false);
-    query_message_usage(
-        connection,
-        since_millis,
-        &mut resolver,
-        Instant::now() + opencode_history_query_timeout(),
-    )
-    .map(|bundle| bundle.agent_usage)
+    query_message_usage(connection, since_millis, &mut resolver, deadline)
+        .map(|bundle| bundle.agent_usage)
 }
 
 fn query_session_agent_usage_fallback(
     connection: &Connection,
     since_millis: i64,
+    deadline: Instant,
 ) -> Result<Vec<AgentUsage>, String> {
     let mut resolver = RepositoryResolver::new(false);
-    query_session_usage(
-        connection,
-        since_millis,
-        &mut resolver,
-        Instant::now() + opencode_history_query_timeout(),
-    )
-    .map(|bundle| bundle.agent_usage)
+    query_session_usage(connection, since_millis, &mut resolver, deadline)
+        .map(|bundle| bundle.agent_usage)
 }
 
 fn agent_usage_from_grouped(grouped: BTreeMap<AgentKey, AgentUsageAccumulator>) -> Vec<AgentUsage> {
@@ -603,23 +629,44 @@ fn non_negative(value: i64) -> u64 {
     value.max(0) as u64
 }
 
+fn with_query_budget<T>(
+    connection: &Connection,
+    operation: impl FnOnce(Instant) -> Result<T, String>,
+) -> Result<T, String> {
+    let deadline = Instant::now() + opencode_history_query_timeout();
+    let _guard = QueryBudgetGuard::install(connection, deadline)?;
+    let value = operation(deadline)?;
+    ensure_query_within_budget(deadline)?;
+    Ok(value)
+}
+
+fn query_budget_error() -> String {
+    format!(
+        "OpenCode history query exceeded the {}-second time budget",
+        opencode_history_query_timeout().as_secs()
+    )
+}
+
 fn ensure_query_within_budget(deadline: Instant) -> Result<(), String> {
     if Instant::now() >= deadline {
-        Err(format!(
-            "OpenCode history query exceeded the {}-second time budget",
-            opencode_history_query_timeout().as_secs()
-        ))
+        Err(query_budget_error())
     } else {
         Ok(())
+    }
+}
+
+fn sqlite_query_error(context: &str, error: rusqlite::Error) -> String {
+    if error.sqlite_error_code() == Some(ErrorCode::OperationInterrupted) {
+        query_budget_error()
+    } else {
+        format!("{context}: {error}")
     }
 }
 
 fn invalid_timestamp_diagnostic(source: &str, count: u64) -> Option<String> {
     match count {
         0 => None,
-        1 => Some(format!(
-            "Skipped 1 {source} row with an invalid timestamp."
-        )),
+        1 => Some(format!("Skipped 1 {source} row with an invalid timestamp.")),
         _ => Some(format!(
             "Skipped {count} {source} rows with invalid timestamps."
         )),
@@ -1434,6 +1481,87 @@ mod tests {
         assert!(
             super::ensure_query_within_budget(Instant::now() - Duration::from_millis(1)).is_err()
         );
+    }
+
+    #[test]
+    fn sqlite_work_is_interrupted_at_the_query_budget_and_handler_is_cleared() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE session (
+                  id TEXT PRIMARY KEY,
+                  directory TEXT,
+                  agent TEXT,
+                  model TEXT,
+                  time_updated INTEGER,
+                  tokens_input INTEGER,
+                  tokens_output INTEGER,
+                  tokens_cache_read INTEGER,
+                  tokens_cache_write INTEGER
+                );
+                INSERT INTO session VALUES (
+                  's1', '/tmp/not-a-real-repository', 'executor',
+                  '{"id":"qwen3.6","providerID":"nan"}', 0, 0, 0, 0, 0
+                );
+                CREATE VIEW message AS
+                WITH RECURSIVE endless(id) AS (
+                  VALUES(1)
+                  UNION ALL
+                  SELECT id + 1 FROM endless
+                )
+                SELECT printf('m%d', id) AS id,
+                       's1' AS session_id,
+                       0 AS time_created,
+                       printf('{"role":"user","id":%d}', id) AS data
+                FROM endless;
+                "#,
+            )
+            .unwrap();
+
+        let started = Instant::now();
+        let mut resolver = RepositoryResolver::new(false);
+        let error = query_message_history(&connection, i64::MIN, &mut resolver).unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "query exceeded its bound: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            error,
+            "OpenCode history query exceeded the 2-second time budget"
+        );
+
+        let sum: i64 = connection
+            .query_row(
+                "WITH RECURSIVE finite(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM finite WHERE value < 10000) SELECT sum(value) FROM finite",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sum, 50_005_000);
+    }
+
+    #[test]
+    fn locked_database_wait_is_bounded_by_the_query_budget() {
+        let root = TestDir::new("locked-database");
+        let database = root.path().join("history.sqlite");
+        let locker = Connection::open(&database).unwrap();
+        create_history_schema(&locker);
+        let reader = Connection::open(&database).unwrap();
+        locker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let started = Instant::now();
+        let mut resolver = RepositoryResolver::new(false);
+        let error = query_session_history_fallback(&reader, i64::MIN, &mut resolver).unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "locked query exceeded its bound: {:?}",
+            started.elapsed()
+        );
+        assert!(error.contains("database is locked"), "{error}");
     }
 
     #[test]
