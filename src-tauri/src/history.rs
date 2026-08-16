@@ -1,5 +1,9 @@
 use chrono::{Datelike, Local, NaiveDate, TimeZone, Utc};
 
+#[allow(
+    dead_code,
+    reason = "Retained as a shared history-window contract for Rust-side filtering helpers."
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryRange {
     Today,
@@ -18,6 +22,10 @@ pub fn local_day(timestamp_millis: i64) -> String {
         .to_string()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained as a shared history-window contract for Rust-side filtering helpers."
+)]
 pub fn range_start(range: HistoryRange, today: NaiveDate) -> NaiveDate {
     match range {
         HistoryRange::Today => today,

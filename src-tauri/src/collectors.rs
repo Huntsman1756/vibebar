@@ -13,12 +13,11 @@ use regex::Regex;
 use serde_json::{Value, json};
 use wait_timeout::ChildExt;
 
-use crate::domain::{
-    ModelQuota, ModelUsage, ProviderSnapshot, QuotaWindow, TokenUsage,
-};
+use crate::domain::{ModelQuota, ModelUsage, ProviderSnapshot, QuotaWindow, TokenUsage};
 use crate::identity::{normalize_provider_id, provider_label};
 
 const MAX_COLLECTOR_OUTPUT: u64 = 8 * 1024 * 1024;
+const OPENCODE_COLLECTOR_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn resolve_program(program: &str) -> PathBuf {
     let mut candidates = Vec::new();
@@ -339,9 +338,13 @@ pub fn collect_opencode() -> Result<Vec<ProviderSnapshot>, String> {
     let output = bounded_output(
         "opencode",
         &["stats", "--pure", "--days", "30", "--models"],
-        Duration::from_secs(25),
+        opencode_collector_timeout(),
     )?;
     parse_opencode_stats(&output)
+}
+
+pub(crate) fn opencode_collector_timeout() -> Duration {
+    OPENCODE_COLLECTOR_TIMEOUT
 }
 
 pub(crate) fn opencode_database_path() -> Option<PathBuf> {
@@ -444,10 +447,10 @@ pub fn collect_codex_rate_limits() -> Result<ProviderSnapshot, String> {
     thread::spawn(move || {
         let bounded = BufReader::new(stdout).take(MAX_COLLECTOR_OUTPUT);
         for line in BufReader::new(bounded).lines().map_while(Result::ok) {
-            if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                if sender.send(value).is_err() {
-                    break;
-                }
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && sender.send(value).is_err()
+            {
+                break;
             }
         }
     });
@@ -697,4 +700,8 @@ done
         assert_eq!(windows[1].duration_minutes, Some(240));
     }
 
+    #[test]
+    fn opencode_stats_timeout_stays_user_responsive() {
+        assert_eq!(opencode_collector_timeout(), Duration::from_secs(5));
+    }
 }

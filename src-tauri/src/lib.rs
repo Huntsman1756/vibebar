@@ -15,17 +15,18 @@ use std::{
 
 use chrono::{DateTime, Days, Duration, Local, LocalResult, TimeZone, Utc};
 use domain::{
-    DashboardSnapshot, ModelUsage, ProviderSnapshot, RecentEvent, TokenUsage, UsageEvent,
-    UsageHistory, UsageHistoryRow,
-    REPOSITORY_ATTRIBUTION_DISABLED, aggregate_agent_usage, aggregate_history_rows,
-    aggregate_workflow,
+    DashboardSnapshot, ModelUsage, ProviderSnapshot, REPOSITORY_ATTRIBUTION_DISABLED, RecentEvent,
+    TokenUsage, UsageEvent, UsageHistory, UsageHistoryRow, aggregate_agent_usage,
+    aggregate_history_rows, aggregate_workflow,
 };
 use identity::{normalize_provider_id, provider_label};
 use tauri::{
-    Manager, State,
+    Emitter, Manager, State,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
+
+const POPOVER_OPENED_EVENT: &str = "vibebar://popover-opened";
 
 struct AppState {
     data_dir: PathBuf,
@@ -106,15 +107,12 @@ fn merge_history_sources(
         .collect::<std::collections::HashSet<_>>();
     let event_history = provider_history_from_events(events, since);
     let mut merged = aggregate_history_rows(
-        primary
-            .rows
-            .into_iter()
-            .chain(
-                event_history
-                    .rows
-                    .into_iter()
-                    .filter(|row| !owned_providers.contains(&normalize_provider_id(&row.provider))),
-            ),
+        primary.rows.into_iter().chain(
+            event_history
+                .rows
+                .into_iter()
+                .filter(|row| !owned_providers.contains(&normalize_provider_id(&row.provider))),
+        ),
     );
     merged.truncated = primary.truncated || event_history.truncated || merged.truncated;
     merged.repository_attribution_enabled = primary.repository_attribution_enabled
@@ -134,9 +132,11 @@ fn synthesize_history_only_provider_cards(
         .collect::<std::collections::HashSet<_>>();
     let mut grouped: BTreeMap<String, BTreeMap<String, (u64, TokenUsage)>> = BTreeMap::new();
 
-    for row in history.rows.iter().filter(|row| {
-        !existing_ids.contains(&normalize_provider_id(&row.provider))
-    }) {
+    for row in history
+        .rows
+        .iter()
+        .filter(|row| !existing_ids.contains(&normalize_provider_id(&row.provider)))
+    {
         let provider_id = normalize_provider_id(&row.provider);
         let entry = grouped
             .entry(provider_id)
@@ -155,7 +155,10 @@ fn synthesize_history_only_provider_cards(
             });
         entry.0 = entry.0.saturating_add(row.message_count);
         entry.1.input_tokens = entry.1.input_tokens.saturating_add(row.tokens.input_tokens);
-        entry.1.output_tokens = entry.1.output_tokens.saturating_add(row.tokens.output_tokens);
+        entry.1.output_tokens = entry
+            .1
+            .output_tokens
+            .saturating_add(row.tokens.output_tokens);
         entry.1.cache_read_tokens = entry
             .1
             .cache_read_tokens
@@ -226,16 +229,28 @@ fn synthesize_history_only_provider_cards(
     providers
 }
 
-fn build_snapshot_from_sources(
+struct SnapshotBuildInputs {
     now: DateTime<Utc>,
     telemetry_path: String,
     providers: Vec<domain::ProviderSnapshot>,
     events: Vec<UsageEvent>,
-    mut diagnostics: Vec<String>,
+    diagnostics: Vec<String>,
     opencode_agent_usage: Result<Vec<domain::AgentUsage>, String>,
     opencode_history: Result<UsageHistory, String>,
     history_since: DateTime<Utc>,
-) -> DashboardSnapshot {
+}
+
+fn build_snapshot_from_sources(inputs: SnapshotBuildInputs) -> DashboardSnapshot {
+    let SnapshotBuildInputs {
+        now,
+        telemetry_path,
+        providers,
+        events,
+        mut diagnostics,
+        opencode_agent_usage,
+        opencode_history,
+        history_since,
+    } = inputs;
     let usage_history = match opencode_history {
         Ok(primary) => merge_history_sources(primary, &events, history_since),
         Err(error) => {
@@ -306,6 +321,7 @@ fn toggle_popover(app: &tauri::AppHandle, tray_position: Option<tauri::PhysicalP
     }
     let _ = popover.show();
     let _ = popover.set_focus();
+    let _ = app.emit(POPOVER_OPENED_EVENT, ());
 }
 
 fn build_snapshot(data_dir: &std::path::Path) -> DashboardSnapshot {
@@ -339,16 +355,16 @@ fn build_snapshot(data_dir: &std::path::Path) -> DashboardSnapshot {
             );
         }
     }
-    build_snapshot_from_sources(
+    build_snapshot_from_sources(SnapshotBuildInputs {
         now,
-        storage::telemetry_path(data_dir).display().to_string(),
+        telemetry_path: storage::telemetry_path(data_dir).display().to_string(),
         providers,
         events,
         diagnostics,
-        opencode_history::collect_opencode_agents(),
-        opencode_history::collect_opencode_history(),
+        opencode_agent_usage: opencode_history::collect_opencode_agents(),
+        opencode_history: opencode_history::collect_opencode_history(),
         history_since,
-    )
+    })
 }
 
 #[tauri::command]
@@ -388,533 +404,6 @@ fn telemetry_path(state: State<'_, AppState>) -> String {
     storage::telemetry_path(&state.data_dir)
         .display()
         .to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        build_snapshot_from_sources, merge_history_sources, opencode_session_fallback_diagnostic,
-        provider_history_from_events,
-    };
-    use crate::domain::{
-        AgentUsage, EventKind, ProviderSnapshot, TokenUsage, UsageEvent, UsageHistory,
-        UsageHistoryRow,
-    };
-    use chrono::{TimeZone, Utc};
-
-    fn usage(source: &str) -> AgentUsage {
-        AgentUsage {
-            agent: "executor".into(),
-            provider: "nan".into(),
-            model: "qwen3.6".into(),
-            source: source.into(),
-            calls: 1,
-            tasks: 1,
-            tokens: TokenUsage {
-                input_tokens: 1,
-                output_tokens: 1,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-            },
-        }
-    }
-
-    fn history_row(
-        day: &str,
-        repository: &str,
-        agent: &str,
-        provider: &str,
-        model: &str,
-        source: &str,
-        source_fidelity: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-    ) -> UsageHistoryRow {
-        UsageHistoryRow {
-            day: day.into(),
-            repository: repository.into(),
-            agent: agent.into(),
-            provider: provider.into(),
-            model: model.into(),
-            source: source.into(),
-            source_fidelity: source_fidelity.into(),
-            message_count: 0,
-            session_count: 0,
-            tokens: TokenUsage {
-                input_tokens,
-                output_tokens,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-            },
-            cost_microusd: None,
-        }
-    }
-
-    fn event(
-        event_id: &str,
-        occurred_at: chrono::DateTime<Utc>,
-        provider: &str,
-        model: &str,
-        role: &str,
-        task_id: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-    ) -> UsageEvent {
-        UsageEvent {
-            schema_version: 1,
-            event_id: event_id.into(),
-            occurred_at,
-            provider: provider.into(),
-            model: model.into(),
-            role: role.into(),
-            task_id: task_id.into(),
-            kind: EventKind::AttemptCompleted,
-            attempt: Some(1),
-            tokens: Some(TokenUsage {
-                input_tokens,
-                output_tokens,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-            }),
-            duration_ms: None,
-            cost_microusd: None,
-        }
-    }
-
-    fn provider(id: &str, label: &str, source: &str) -> ProviderSnapshot {
-        ProviderSnapshot {
-            id: id.into(),
-            label: label.into(),
-            source: source.into(),
-            status: "ok".into(),
-            calls: 1,
-            tokens: TokenUsage {
-                input_tokens: 10,
-                output_tokens: 5,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-            },
-            models: Vec::new(),
-            windows: Vec::new(),
-            updated_at: "2026-08-16T10:00:00Z".into(),
-            error: None,
-        }
-    }
-
-    #[test]
-    fn session_fallback_agent_usage_produces_snapshot_diagnostic() {
-        assert!(opencode_session_fallback_diagnostic(&[usage("opencode-db-session-31d-fallback")])
-            .is_some());
-        assert!(opencode_session_fallback_diagnostic(&[usage("opencode-db-messages-31d")]).is_none());
-        assert!(opencode_session_fallback_diagnostic(&[usage("vibebar-events-30d")]).is_none());
-    }
-
-    #[test]
-    fn merge_history_sources_drops_event_rows_for_database_owned_providers() {
-        let primary = UsageHistory {
-            rows: vec![
-                history_row(
-                    "2026-08-15",
-                    "github.com/example/alpha",
-                    "executor",
-                    "nan",
-                    "qwen3.6",
-                    "opencode-db-messages-31d",
-                    "metadata",
-                    120,
-                    30,
-                ),
-                history_row(
-                    "2026-08-15",
-                    "github.com/example/beta",
-                    "reviewer",
-                    "opencode-go",
-                    "qwen3.6",
-                    "opencode-db-messages-31d",
-                    "metadata",
-                    40,
-                    5,
-                ),
-            ],
-            oldest_day: Some("2026-08-15".into()),
-            newest_day: Some("2026-08-15".into()),
-            truncated: false,
-            repository_attribution_enabled: true,
-        };
-        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
-        let events = vec![
-            event(
-                "evt-nan",
-                Utc.with_ymd_and_hms(2026, 8, 15, 12, 0, 0).unwrap(),
-                "nan",
-                "deepseek-v4-flash",
-                "reviewer",
-                "task-1",
-                900,
-                90,
-            ),
-            event(
-                "evt-opencode-go",
-                Utc.with_ymd_and_hms(2026, 8, 15, 13, 0, 0).unwrap(),
-                "opencode-go",
-                "glm5.2",
-                "executor",
-                "task-2",
-                400,
-                40,
-            ),
-        ];
-
-        let merged = merge_history_sources(primary, &events, since);
-
-        assert_eq!(merged.rows.len(), 2);
-        assert_eq!(
-            merged
-                .rows
-                .iter()
-                .filter(|row| row.provider == "nan")
-                .map(|row| row.tokens.billable())
-                .sum::<u64>(),
-            150
-        );
-        assert_eq!(
-            merged
-                .rows
-                .iter()
-                .filter(|row| row.provider == "opencode-go")
-                .map(|row| row.tokens.billable())
-                .sum::<u64>(),
-            45
-        );
-        assert!(
-            merged
-                .rows
-                .iter()
-                .all(|row| row.source != "vibebar-events-31d")
-        );
-    }
-
-    #[test]
-    fn merge_history_sources_keeps_event_only_rows_for_non_database_providers() {
-        let primary = UsageHistory {
-            rows: vec![
-                history_row(
-                    "2026-08-15",
-                    "github.com/example/alpha",
-                    "executor",
-                    "nan",
-                    "qwen3.6",
-                    "opencode-db-messages-31d",
-                    "metadata",
-                    120,
-                    30,
-                ),
-                history_row(
-                    "2026-08-15",
-                    "github.com/example/beta",
-                    "reviewer",
-                    "opencode-go",
-                    "qwen3.6",
-                    "opencode-db-messages-31d",
-                    "metadata",
-                    40,
-                    5,
-                ),
-            ],
-            oldest_day: Some("2026-08-15".into()),
-            newest_day: Some("2026-08-15".into()),
-            truncated: false,
-            repository_attribution_enabled: true,
-        };
-        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
-        let events = vec![
-            event(
-                "evt-chatgpt",
-                Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap(),
-                "chatgpt-codex",
-                "codex",
-                "reviewer",
-                "task-3",
-                80,
-                20,
-            ),
-            event(
-                "evt-custom",
-                Utc.with_ymd_and_hms(2026, 8, 16, 15, 0, 0).unwrap(),
-                "custom-provider",
-                "glm5.2",
-                "auditor",
-                "task-4",
-                25,
-                5,
-            ),
-        ];
-
-        let merged = merge_history_sources(primary, &events, since);
-
-        assert!(merged.rows.iter().any(|row| {
-            row.provider == "chatgpt-codex"
-                && row.source == "vibebar-events-31d"
-                && row.repository == "Repository attribution disabled"
-        }));
-        assert!(merged.rows.iter().any(|row| {
-            row.provider == "custom-provider"
-                && row.source == "vibebar-events-31d"
-                && row.repository == "Repository attribution disabled"
-        }));
-    }
-
-    #[test]
-    fn merge_history_sources_normalizes_event_provider_before_ownership_deduplication() {
-        let primary = UsageHistory {
-            rows: vec![history_row(
-                "2026-08-15",
-                "github.com/example/alpha",
-                "executor",
-                "nan",
-                "qwen3.6",
-                "opencode-db-messages-31d",
-                "metadata",
-                120,
-                30,
-            )],
-            oldest_day: Some("2026-08-15".into()),
-            newest_day: Some("2026-08-15".into()),
-            truncated: false,
-            repository_attribution_enabled: true,
-        };
-        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
-
-        let merged = merge_history_sources(
-            primary,
-            &[event(
-                "evt-nan-whitespace",
-                Utc.with_ymd_and_hms(2026, 8, 15, 12, 0, 0).unwrap(),
-                " NaN ",
-                "deepseek-v4-flash",
-                "reviewer",
-                "task-1",
-                900,
-                90,
-            )],
-            since,
-        );
-
-        assert_eq!(merged.rows.len(), 1);
-        assert_eq!(merged.rows[0].provider, "nan");
-        assert_eq!(merged.rows[0].tokens.billable(), 150);
-        assert!(merged.rows.iter().all(|row| row.source != "vibebar-events-31d"));
-    }
-
-    #[test]
-    fn provider_history_from_events_uses_disabled_repository_marker_and_31_day_source() {
-        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
-        let history = provider_history_from_events(
-            &[
-                event(
-                    "evt-in-range",
-                    Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap(),
-                    "chatgpt-codex",
-                    "codex",
-                    "reviewer",
-                    "task-1",
-                    60,
-                    10,
-                ),
-                event(
-                    "evt-too-old",
-                    Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap(),
-                    "chatgpt-codex",
-                    "codex",
-                    "reviewer",
-                    "task-2",
-                    999,
-                    1,
-                ),
-            ],
-            since,
-        );
-
-        assert_eq!(history.rows.len(), 1);
-        assert_eq!(history.rows[0].day, "2026-08-16");
-        assert_eq!(
-            history.rows[0].repository,
-            "Repository attribution disabled"
-        );
-        assert_eq!(history.rows[0].source, "vibebar-events-31d");
-        assert_eq!(history.rows[0].source_fidelity, "event-fallback");
-        assert_eq!(history.rows[0].tokens.billable(), 70);
-        assert_eq!(history.rows[0].message_count, 0);
-        assert_eq!(history.rows[0].session_count, 0);
-        assert!(!history.repository_attribution_enabled);
-    }
-
-    #[test]
-    fn snapshot_history_diagnostics_do_not_hide_provider_cards() {
-        let now = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
-        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
-        let providers = vec![
-            provider("chatgpt-codex", "ChatGPT · Codex", "codex-app-server"),
-            provider("nan", "NaN", "opencode-stats-30d"),
-        ];
-        let primary_history = UsageHistory {
-            rows: vec![history_row(
-                "2026-08-16",
-                "github.com/example/alpha",
-                "executor",
-                "nan",
-                "qwen3.6",
-                "opencode-db-session-31d-fallback",
-                "session-fallback",
-                120,
-                30,
-            )],
-            oldest_day: Some("2026-08-16".into()),
-            newest_day: Some("2026-08-16".into()),
-            truncated: true,
-            repository_attribution_enabled: true,
-        };
-        let snapshot = build_snapshot_from_sources(
-            now,
-            "/tmp/events-v1.jsonl".into(),
-            providers,
-            vec![event(
-                "evt-chatgpt",
-                Utc.with_ymd_and_hms(2026, 8, 16, 13, 0, 0).unwrap(),
-                "chatgpt-codex",
-                "codex",
-                "reviewer",
-                "task-5",
-                80,
-                20,
-            )],
-            vec!["ignored malformed telemetry line 3".into()],
-            Ok(vec![usage("opencode-db-messages-31d")]),
-            Ok(primary_history),
-            since,
-        );
-
-        assert_eq!(snapshot.providers.len(), 2);
-        assert!(snapshot.providers.iter().any(|provider| provider.id == "chatgpt-codex"));
-        assert!(snapshot.providers.iter().any(|provider| provider.id == "nan"));
-        assert!(snapshot.diagnostics.iter().any(|item| item.contains("malformed telemetry")));
-        assert!(snapshot
-            .diagnostics
-            .iter()
-            .any(|item| item.contains("lower-fidelity session aggregates")));
-        assert!(snapshot
-            .diagnostics
-            .iter()
-            .any(|item| item.contains("truncated")));
-        assert!(snapshot.usage_history.rows.iter().any(|row| {
-            row.provider == "chatgpt-codex" && row.source == "vibebar-events-31d"
-        }));
-    }
-
-    #[test]
-    fn snapshot_synthesizes_history_only_provider_cards_without_overriding_existing_cards() {
-        let now = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
-        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
-        let providers = vec![
-            ProviderSnapshot {
-                id: "nan".into(),
-                label: "NaN".into(),
-                source: "opencode-stats-30d".into(),
-                status: "error".into(),
-                calls: 0,
-                tokens: TokenUsage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_read_tokens: 0,
-                    cache_write_tokens: 0,
-                },
-                models: Vec::new(),
-                windows: Vec::new(),
-                updated_at: "2026-08-16T10:00:00Z".into(),
-                error: Some("OpenCode stats unavailable".into()),
-            },
-        ];
-        let primary_history = UsageHistory {
-            rows: vec![
-                history_row(
-                    "2026-08-16",
-                    "github.com/example/alpha",
-                    "executor",
-                    "custom-provider",
-                    "glm5.2",
-                    "opencode-db-messages-31d",
-                    "metadata",
-                    120,
-                    30,
-                ),
-                history_row(
-                    "2026-08-16",
-                    "github.com/example/beta",
-                    "reviewer",
-                    "custom-provider",
-                    "glm5.2",
-                    "opencode-db-messages-31d",
-                    "metadata",
-                    25,
-                    5,
-                ),
-                history_row(
-                    "2026-08-16",
-                    "github.com/example/gamma",
-                    "executor",
-                    "nan",
-                    "qwen3.6",
-                    "opencode-db-messages-31d",
-                    "metadata",
-                    900,
-                    90,
-                ),
-            ],
-            oldest_day: Some("2026-08-16".into()),
-            newest_day: Some("2026-08-16".into()),
-            truncated: false,
-            repository_attribution_enabled: true,
-        };
-
-        let snapshot = build_snapshot_from_sources(
-            now,
-            "/tmp/events-v1.jsonl".into(),
-            providers,
-            Vec::new(),
-            Vec::new(),
-            Ok(Vec::new()),
-            Ok(primary_history),
-            since,
-        );
-
-        let custom = snapshot
-            .providers
-            .iter()
-            .find(|provider| provider.id == "custom-provider")
-            .expect("history-only provider card should be synthesized");
-        assert_eq!(custom.label, "Custom Provider");
-        assert_eq!(custom.source, "usage-history-31d");
-        assert_eq!(custom.status, "ok");
-        assert_eq!(custom.calls, 0);
-        assert_eq!(custom.tokens.input_tokens, 145);
-        assert_eq!(custom.tokens.output_tokens, 35);
-        assert_eq!(custom.tokens.billable(), 180);
-        assert_eq!(custom.models.len(), 1);
-        assert_eq!(custom.models[0].model, "glm5.2");
-        assert_eq!(custom.models[0].calls, 0);
-        assert_eq!(custom.models[0].tokens.billable(), 180);
-        assert!(custom.windows.is_empty());
-        assert_eq!(custom.error, None);
-
-        let nan = snapshot
-            .providers
-            .iter()
-            .find(|provider| provider.id == "nan")
-            .expect("existing provider card should remain");
-        assert_eq!(nan.source, "opencode-stats-30d");
-        assert_eq!(nan.status, "error");
-        assert_eq!(nan.error.as_deref(), Some("OpenCode stats unavailable"));
-    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -971,4 +460,563 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running VibeBar");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SnapshotBuildInputs, build_snapshot_from_sources, merge_history_sources,
+        opencode_session_fallback_diagnostic, provider_history_from_events,
+    };
+    use crate::domain::{
+        AgentUsage, EventKind, ProviderSnapshot, TokenUsage, UsageEvent, UsageHistory,
+        UsageHistoryRow,
+    };
+    use chrono::{TimeZone, Utc};
+
+    fn usage(source: &str) -> AgentUsage {
+        AgentUsage {
+            agent: "executor".into(),
+            provider: "nan".into(),
+            model: "qwen3.6".into(),
+            source: source.into(),
+            calls: 1,
+            tasks: 1,
+            tokens: TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        }
+    }
+
+    struct HistoryRowSpec<'a> {
+        day: &'a str,
+        repository: &'a str,
+        agent: &'a str,
+        provider: &'a str,
+        model: &'a str,
+        source: &'a str,
+        source_fidelity: &'a str,
+        input_tokens: u64,
+        output_tokens: u64,
+    }
+
+    fn history_row(spec: HistoryRowSpec<'_>) -> UsageHistoryRow {
+        UsageHistoryRow {
+            day: spec.day.into(),
+            repository: spec.repository.into(),
+            agent: spec.agent.into(),
+            provider: spec.provider.into(),
+            model: spec.model.into(),
+            source: spec.source.into(),
+            source_fidelity: spec.source_fidelity.into(),
+            message_count: 0,
+            session_count: 0,
+            tokens: TokenUsage {
+                input_tokens: spec.input_tokens,
+                output_tokens: spec.output_tokens,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            cost_microusd: None,
+        }
+    }
+
+    struct EventSpec<'a> {
+        event_id: &'a str,
+        occurred_at: chrono::DateTime<Utc>,
+        provider: &'a str,
+        model: &'a str,
+        role: &'a str,
+        task_id: &'a str,
+        input_tokens: u64,
+        output_tokens: u64,
+    }
+
+    fn event(spec: EventSpec<'_>) -> UsageEvent {
+        UsageEvent {
+            schema_version: 1,
+            event_id: spec.event_id.into(),
+            occurred_at: spec.occurred_at,
+            provider: spec.provider.into(),
+            model: spec.model.into(),
+            role: spec.role.into(),
+            task_id: spec.task_id.into(),
+            kind: EventKind::AttemptCompleted,
+            attempt: Some(1),
+            tokens: Some(TokenUsage {
+                input_tokens: spec.input_tokens,
+                output_tokens: spec.output_tokens,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            }),
+            duration_ms: None,
+            cost_microusd: None,
+        }
+    }
+
+    fn provider(id: &str, label: &str, source: &str) -> ProviderSnapshot {
+        ProviderSnapshot {
+            id: id.into(),
+            label: label.into(),
+            source: source.into(),
+            status: "ok".into(),
+            calls: 1,
+            tokens: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            models: Vec::new(),
+            windows: Vec::new(),
+            updated_at: "2026-08-16T10:00:00Z".into(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn session_fallback_agent_usage_produces_snapshot_diagnostic() {
+        assert!(
+            opencode_session_fallback_diagnostic(&[usage("opencode-db-session-31d-fallback")])
+                .is_some()
+        );
+        assert!(
+            opencode_session_fallback_diagnostic(&[usage("opencode-db-messages-31d")]).is_none()
+        );
+        assert!(opencode_session_fallback_diagnostic(&[usage("vibebar-events-30d")]).is_none());
+    }
+
+    #[test]
+    fn merge_history_sources_drops_event_rows_for_database_owned_providers() {
+        let primary = UsageHistory {
+            rows: vec![
+                history_row(HistoryRowSpec {
+                    day: "2026-08-15",
+                    repository: "github.com/example/alpha",
+                    agent: "executor",
+                    provider: "nan",
+                    model: "qwen3.6",
+                    source: "opencode-db-messages-31d",
+                    source_fidelity: "metadata",
+                    input_tokens: 120,
+                    output_tokens: 30,
+                }),
+                history_row(HistoryRowSpec {
+                    day: "2026-08-15",
+                    repository: "github.com/example/beta",
+                    agent: "reviewer",
+                    provider: "opencode-go",
+                    model: "qwen3.6",
+                    source: "opencode-db-messages-31d",
+                    source_fidelity: "metadata",
+                    input_tokens: 40,
+                    output_tokens: 5,
+                }),
+            ],
+            oldest_day: Some("2026-08-15".into()),
+            newest_day: Some("2026-08-15".into()),
+            truncated: false,
+            repository_attribution_enabled: true,
+        };
+        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
+        let events = vec![
+            event(EventSpec {
+                event_id: "evt-nan",
+                occurred_at: Utc.with_ymd_and_hms(2026, 8, 15, 12, 0, 0).unwrap(),
+                provider: "nan",
+                model: "deepseek-v4-flash",
+                role: "reviewer",
+                task_id: "task-1",
+                input_tokens: 900,
+                output_tokens: 90,
+            }),
+            event(EventSpec {
+                event_id: "evt-opencode-go",
+                occurred_at: Utc.with_ymd_and_hms(2026, 8, 15, 13, 0, 0).unwrap(),
+                provider: "opencode-go",
+                model: "glm5.2",
+                role: "executor",
+                task_id: "task-2",
+                input_tokens: 400,
+                output_tokens: 40,
+            }),
+        ];
+
+        let merged = merge_history_sources(primary, &events, since);
+
+        assert_eq!(merged.rows.len(), 2);
+        assert_eq!(
+            merged
+                .rows
+                .iter()
+                .filter(|row| row.provider == "nan")
+                .map(|row| row.tokens.billable())
+                .sum::<u64>(),
+            150
+        );
+        assert_eq!(
+            merged
+                .rows
+                .iter()
+                .filter(|row| row.provider == "opencode-go")
+                .map(|row| row.tokens.billable())
+                .sum::<u64>(),
+            45
+        );
+        assert!(
+            merged
+                .rows
+                .iter()
+                .all(|row| row.source != "vibebar-events-31d")
+        );
+    }
+
+    #[test]
+    fn merge_history_sources_keeps_event_only_rows_for_non_database_providers() {
+        let primary = UsageHistory {
+            rows: vec![
+                history_row(HistoryRowSpec {
+                    day: "2026-08-15",
+                    repository: "github.com/example/alpha",
+                    agent: "executor",
+                    provider: "nan",
+                    model: "qwen3.6",
+                    source: "opencode-db-messages-31d",
+                    source_fidelity: "metadata",
+                    input_tokens: 120,
+                    output_tokens: 30,
+                }),
+                history_row(HistoryRowSpec {
+                    day: "2026-08-15",
+                    repository: "github.com/example/beta",
+                    agent: "reviewer",
+                    provider: "opencode-go",
+                    model: "qwen3.6",
+                    source: "opencode-db-messages-31d",
+                    source_fidelity: "metadata",
+                    input_tokens: 40,
+                    output_tokens: 5,
+                }),
+            ],
+            oldest_day: Some("2026-08-15".into()),
+            newest_day: Some("2026-08-15".into()),
+            truncated: false,
+            repository_attribution_enabled: true,
+        };
+        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
+        let events = vec![
+            event(EventSpec {
+                event_id: "evt-chatgpt",
+                occurred_at: Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap(),
+                provider: "chatgpt-codex",
+                model: "codex",
+                role: "reviewer",
+                task_id: "task-3",
+                input_tokens: 80,
+                output_tokens: 20,
+            }),
+            event(EventSpec {
+                event_id: "evt-custom",
+                occurred_at: Utc.with_ymd_and_hms(2026, 8, 16, 15, 0, 0).unwrap(),
+                provider: "custom-provider",
+                model: "glm5.2",
+                role: "auditor",
+                task_id: "task-4",
+                input_tokens: 25,
+                output_tokens: 5,
+            }),
+        ];
+
+        let merged = merge_history_sources(primary, &events, since);
+
+        assert!(merged.rows.iter().any(|row| {
+            row.provider == "chatgpt-codex"
+                && row.source == "vibebar-events-31d"
+                && row.repository == "Repository attribution disabled"
+        }));
+        assert!(merged.rows.iter().any(|row| {
+            row.provider == "custom-provider"
+                && row.source == "vibebar-events-31d"
+                && row.repository == "Repository attribution disabled"
+        }));
+    }
+
+    #[test]
+    fn merge_history_sources_normalizes_event_provider_before_ownership_deduplication() {
+        let primary = UsageHistory {
+            rows: vec![history_row(HistoryRowSpec {
+                day: "2026-08-15",
+                repository: "github.com/example/alpha",
+                agent: "executor",
+                provider: "nan",
+                model: "qwen3.6",
+                source: "opencode-db-messages-31d",
+                source_fidelity: "metadata",
+                input_tokens: 120,
+                output_tokens: 30,
+            })],
+            oldest_day: Some("2026-08-15".into()),
+            newest_day: Some("2026-08-15".into()),
+            truncated: false,
+            repository_attribution_enabled: true,
+        };
+        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
+
+        let merged = merge_history_sources(
+            primary,
+            &[event(EventSpec {
+                event_id: "evt-nan-whitespace",
+                occurred_at: Utc.with_ymd_and_hms(2026, 8, 15, 12, 0, 0).unwrap(),
+                provider: " NaN ",
+                model: "deepseek-v4-flash",
+                role: "reviewer",
+                task_id: "task-1",
+                input_tokens: 900,
+                output_tokens: 90,
+            })],
+            since,
+        );
+
+        assert_eq!(merged.rows.len(), 1);
+        assert_eq!(merged.rows[0].provider, "nan");
+        assert_eq!(merged.rows[0].tokens.billable(), 150);
+        assert!(
+            merged
+                .rows
+                .iter()
+                .all(|row| row.source != "vibebar-events-31d")
+        );
+    }
+
+    #[test]
+    fn provider_history_from_events_uses_disabled_repository_marker_and_31_day_source() {
+        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
+        let history = provider_history_from_events(
+            &[
+                event(EventSpec {
+                    event_id: "evt-in-range",
+                    occurred_at: Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap(),
+                    provider: "chatgpt-codex",
+                    model: "codex",
+                    role: "reviewer",
+                    task_id: "task-1",
+                    input_tokens: 60,
+                    output_tokens: 10,
+                }),
+                event(EventSpec {
+                    event_id: "evt-too-old",
+                    occurred_at: Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap(),
+                    provider: "chatgpt-codex",
+                    model: "codex",
+                    role: "reviewer",
+                    task_id: "task-2",
+                    input_tokens: 999,
+                    output_tokens: 1,
+                }),
+            ],
+            since,
+        );
+
+        assert_eq!(history.rows.len(), 1);
+        assert_eq!(history.rows[0].day, "2026-08-16");
+        assert_eq!(
+            history.rows[0].repository,
+            "Repository attribution disabled"
+        );
+        assert_eq!(history.rows[0].source, "vibebar-events-31d");
+        assert_eq!(history.rows[0].source_fidelity, "event-fallback");
+        assert_eq!(history.rows[0].tokens.billable(), 70);
+        assert_eq!(history.rows[0].message_count, 0);
+        assert_eq!(history.rows[0].session_count, 0);
+        assert!(!history.repository_attribution_enabled);
+    }
+
+    #[test]
+    fn snapshot_history_diagnostics_do_not_hide_provider_cards() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
+        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
+        let providers = vec![
+            provider("chatgpt-codex", "ChatGPT · Codex", "codex-app-server"),
+            provider("nan", "NaN", "opencode-stats-30d"),
+        ];
+        let primary_history = UsageHistory {
+            rows: vec![history_row(HistoryRowSpec {
+                day: "2026-08-16",
+                repository: "github.com/example/alpha",
+                agent: "executor",
+                provider: "nan",
+                model: "qwen3.6",
+                source: "opencode-db-session-31d-fallback",
+                source_fidelity: "session-fallback",
+                input_tokens: 120,
+                output_tokens: 30,
+            })],
+            oldest_day: Some("2026-08-16".into()),
+            newest_day: Some("2026-08-16".into()),
+            truncated: true,
+            repository_attribution_enabled: true,
+        };
+        let snapshot = build_snapshot_from_sources(SnapshotBuildInputs {
+            now,
+            telemetry_path: "/tmp/events-v1.jsonl".into(),
+            providers,
+            events: vec![event(EventSpec {
+                event_id: "evt-chatgpt",
+                occurred_at: Utc.with_ymd_and_hms(2026, 8, 16, 13, 0, 0).unwrap(),
+                provider: "chatgpt-codex",
+                model: "codex",
+                role: "reviewer",
+                task_id: "task-5",
+                input_tokens: 80,
+                output_tokens: 20,
+            })],
+            diagnostics: vec!["ignored malformed telemetry line 3".into()],
+            opencode_agent_usage: Ok(vec![usage("opencode-db-messages-31d")]),
+            opencode_history: Ok(primary_history),
+            history_since: since,
+        });
+
+        assert_eq!(snapshot.providers.len(), 2);
+        assert!(
+            snapshot
+                .providers
+                .iter()
+                .any(|provider| provider.id == "chatgpt-codex")
+        );
+        assert!(
+            snapshot
+                .providers
+                .iter()
+                .any(|provider| provider.id == "nan")
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|item| item.contains("malformed telemetry"))
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|item| item.contains("lower-fidelity session aggregates"))
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|item| item.contains("truncated"))
+        );
+        assert!(
+            snapshot.usage_history.rows.iter().any(|row| {
+                row.provider == "chatgpt-codex" && row.source == "vibebar-events-31d"
+            })
+        );
+    }
+
+    #[test]
+    fn snapshot_synthesizes_history_only_provider_cards_without_overriding_existing_cards() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
+        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
+        let providers = vec![ProviderSnapshot {
+            id: "nan".into(),
+            label: "NaN".into(),
+            source: "opencode-stats-30d".into(),
+            status: "error".into(),
+            calls: 0,
+            tokens: TokenUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            models: Vec::new(),
+            windows: Vec::new(),
+            updated_at: "2026-08-16T10:00:00Z".into(),
+            error: Some("OpenCode stats unavailable".into()),
+        }];
+        let primary_history = UsageHistory {
+            rows: vec![
+                history_row(HistoryRowSpec {
+                    day: "2026-08-16",
+                    repository: "github.com/example/alpha",
+                    agent: "executor",
+                    provider: "custom-provider",
+                    model: "glm5.2",
+                    source: "opencode-db-messages-31d",
+                    source_fidelity: "metadata",
+                    input_tokens: 120,
+                    output_tokens: 30,
+                }),
+                history_row(HistoryRowSpec {
+                    day: "2026-08-16",
+                    repository: "github.com/example/beta",
+                    agent: "reviewer",
+                    provider: "custom-provider",
+                    model: "glm5.2",
+                    source: "opencode-db-messages-31d",
+                    source_fidelity: "metadata",
+                    input_tokens: 25,
+                    output_tokens: 5,
+                }),
+                history_row(HistoryRowSpec {
+                    day: "2026-08-16",
+                    repository: "github.com/example/gamma",
+                    agent: "executor",
+                    provider: "nan",
+                    model: "qwen3.6",
+                    source: "opencode-db-messages-31d",
+                    source_fidelity: "metadata",
+                    input_tokens: 900,
+                    output_tokens: 90,
+                }),
+            ],
+            oldest_day: Some("2026-08-16".into()),
+            newest_day: Some("2026-08-16".into()),
+            truncated: false,
+            repository_attribution_enabled: true,
+        };
+
+        let snapshot = build_snapshot_from_sources(SnapshotBuildInputs {
+            now,
+            telemetry_path: "/tmp/events-v1.jsonl".into(),
+            providers,
+            events: Vec::new(),
+            diagnostics: Vec::new(),
+            opencode_agent_usage: Ok(Vec::new()),
+            opencode_history: Ok(primary_history),
+            history_since: since,
+        });
+
+        let custom = snapshot
+            .providers
+            .iter()
+            .find(|provider| provider.id == "custom-provider")
+            .expect("history-only provider card should be synthesized");
+        assert_eq!(custom.label, "Custom Provider");
+        assert_eq!(custom.source, "usage-history-31d");
+        assert_eq!(custom.status, "ok");
+        assert_eq!(custom.calls, 0);
+        assert_eq!(custom.tokens.input_tokens, 145);
+        assert_eq!(custom.tokens.output_tokens, 35);
+        assert_eq!(custom.tokens.billable(), 180);
+        assert_eq!(custom.models.len(), 1);
+        assert_eq!(custom.models[0].model, "glm5.2");
+        assert_eq!(custom.models[0].calls, 0);
+        assert_eq!(custom.models[0].tokens.billable(), 180);
+        assert!(custom.windows.is_empty());
+        assert_eq!(custom.error, None);
+
+        let nan = snapshot
+            .providers
+            .iter()
+            .find(|provider| provider.id == "nan")
+            .expect("existing provider card should remain");
+        assert_eq!(nan.source, "opencode-stats-30d");
+        assert_eq!(nan.status, "error");
+        assert_eq!(nan.error.as_deref(), Some("OpenCode stats unavailable"));
+    }
 }

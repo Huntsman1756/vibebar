@@ -186,7 +186,7 @@ pub struct UsageHistoryRow {
     pub cost_microusd: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageHistory {
     #[serde(default)]
@@ -195,18 +195,6 @@ pub struct UsageHistory {
     pub newest_day: Option<String>,
     pub truncated: bool,
     pub repository_attribution_enabled: bool,
-}
-
-impl Default for UsageHistory {
-    fn default() -> Self {
-        Self {
-            rows: Vec::new(),
-            oldest_day: None,
-            newest_day: None,
-            truncated: false,
-            repository_attribution_enabled: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +212,7 @@ pub struct DashboardSnapshot {
 }
 
 const USAGE_HISTORY_ROW_LIMIT: usize = 1_000;
+type UsageHistoryAggregateKey = (String, String, String, String, String, String, String);
 
 pub fn aggregate_workflow(events: &[UsageEvent]) -> WorkflowMetrics {
     let mut task_states: BTreeMap<&str, bool> = BTreeMap::new();
@@ -376,10 +365,7 @@ pub fn merge_agent_usage(primary: Vec<AgentUsage>, fallback: Vec<AgentUsage>) ->
 }
 
 pub fn aggregate_history_rows(rows: impl IntoIterator<Item = UsageHistoryRow>) -> UsageHistory {
-    let mut grouped: BTreeMap<
-        (String, String, String, String, String, String, String),
-        UsageHistoryRow,
-    > = BTreeMap::new();
+    let mut grouped: BTreeMap<UsageHistoryAggregateKey, UsageHistoryRow> = BTreeMap::new();
 
     for row in rows {
         let key = (
@@ -435,11 +421,19 @@ pub fn aggregate_history_rows(rows: impl IntoIterator<Item = UsageHistoryRow>) -
         };
     }
 
-    let oldest_day = grouped.values().map(|row| row.day.as_str()).min().map(str::to_owned);
-    let newest_day = grouped.values().map(|row| row.day.as_str()).max().map(str::to_owned);
-    let repository_attribution_enabled = grouped.values().any(|row| {
-        !row.repository.is_empty() && row.repository != REPOSITORY_ATTRIBUTION_DISABLED
-    });
+    let oldest_day = grouped
+        .values()
+        .map(|row| row.day.as_str())
+        .min()
+        .map(str::to_owned);
+    let newest_day = grouped
+        .values()
+        .map(|row| row.day.as_str())
+        .max()
+        .map(str::to_owned);
+    let repository_attribution_enabled = grouped
+        .values()
+        .any(|row| !row.repository.is_empty() && row.repository != REPOSITORY_ATTRIBUTION_DISABLED);
 
     let mut rows = grouped.into_values().collect::<Vec<_>>();
     rows.sort_by(|left, right| {
@@ -486,36 +480,38 @@ pub fn validate_batch(events: &[UsageEvent]) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn history_row(
-        day: &str,
-        repository: &str,
-        agent: &str,
-        provider: &str,
-        model: &str,
+    struct HistoryRowSpec<'a> {
+        day: &'a str,
+        repository: &'a str,
+        agent: &'a str,
+        provider: &'a str,
+        model: &'a str,
         input_tokens: u64,
         output_tokens: u64,
         cache_read_tokens: u64,
         message_count: u64,
         session_count: u64,
         cost_microusd: Option<u64>,
-    ) -> UsageHistoryRow {
+    }
+
+    fn history_row(spec: HistoryRowSpec<'_>) -> UsageHistoryRow {
         UsageHistoryRow {
-            day: day.into(),
-            repository: repository.into(),
-            agent: agent.into(),
-            provider: provider.into(),
-            model: model.into(),
+            day: spec.day.into(),
+            repository: spec.repository.into(),
+            agent: spec.agent.into(),
+            provider: spec.provider.into(),
+            model: spec.model.into(),
             source: "opencode-db-30d".into(),
             source_fidelity: "message-metadata".into(),
-            message_count,
-            session_count,
+            message_count: spec.message_count,
+            session_count: spec.session_count,
             tokens: TokenUsage {
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
+                input_tokens: spec.input_tokens,
+                output_tokens: spec.output_tokens,
+                cache_read_tokens: spec.cache_read_tokens,
                 cache_write_tokens: 0,
             },
-            cost_microusd,
+            cost_microusd: spec.cost_microusd,
         }
     }
 
@@ -737,84 +733,84 @@ mod tests {
     #[test]
     fn history_rows_preserve_distinct_dimensions_and_sum_matching_rows() {
         let history = aggregate_history_rows(vec![
-            history_row(
-                "2026-08-16",
-                "github.com/example/alpha",
-                "executor",
-                "nan",
-                "qwen3.6",
-                10,
-                5,
-                100,
-                2,
-                1,
-                Some(8),
-            ),
-            history_row(
-                "2026-08-16",
-                "github.com/example/alpha",
-                "executor",
-                "nan",
-                "qwen3.6",
-                7,
-                3,
-                50,
-                1,
-                2,
-                Some(4),
-            ),
-            history_row(
-                "2026-08-16",
-                "github.com/example/beta",
-                "executor",
-                "nan",
-                "qwen3.6",
-                9,
-                1,
-                0,
-                1,
-                1,
-                Some(3),
-            ),
-            history_row(
-                "2026-08-16",
-                "github.com/example/alpha",
-                "reviewer",
-                "nan",
-                "qwen3.6",
-                8,
-                1,
-                0,
-                1,
-                1,
-                None,
-            ),
-            history_row(
-                "2026-08-16",
-                "github.com/example/alpha",
-                "executor",
-                "opencode-go",
-                "qwen3.6",
-                6,
-                1,
-                0,
-                1,
-                1,
-                Some(2),
-            ),
-            history_row(
-                "2026-08-16",
-                "github.com/example/alpha",
-                "executor",
-                "nan",
-                "glm5.2",
-                5,
-                4,
-                0,
-                1,
-                1,
-                Some(5),
-            ),
+            history_row(HistoryRowSpec {
+                day: "2026-08-16",
+                repository: "github.com/example/alpha",
+                agent: "executor",
+                provider: "nan",
+                model: "qwen3.6",
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: 100,
+                message_count: 2,
+                session_count: 1,
+                cost_microusd: Some(8),
+            }),
+            history_row(HistoryRowSpec {
+                day: "2026-08-16",
+                repository: "github.com/example/alpha",
+                agent: "executor",
+                provider: "nan",
+                model: "qwen3.6",
+                input_tokens: 7,
+                output_tokens: 3,
+                cache_read_tokens: 50,
+                message_count: 1,
+                session_count: 2,
+                cost_microusd: Some(4),
+            }),
+            history_row(HistoryRowSpec {
+                day: "2026-08-16",
+                repository: "github.com/example/beta",
+                agent: "executor",
+                provider: "nan",
+                model: "qwen3.6",
+                input_tokens: 9,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                message_count: 1,
+                session_count: 1,
+                cost_microusd: Some(3),
+            }),
+            history_row(HistoryRowSpec {
+                day: "2026-08-16",
+                repository: "github.com/example/alpha",
+                agent: "reviewer",
+                provider: "nan",
+                model: "qwen3.6",
+                input_tokens: 8,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                message_count: 1,
+                session_count: 1,
+                cost_microusd: None,
+            }),
+            history_row(HistoryRowSpec {
+                day: "2026-08-16",
+                repository: "github.com/example/alpha",
+                agent: "executor",
+                provider: "opencode-go",
+                model: "qwen3.6",
+                input_tokens: 6,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                message_count: 1,
+                session_count: 1,
+                cost_microusd: Some(2),
+            }),
+            history_row(HistoryRowSpec {
+                day: "2026-08-16",
+                repository: "github.com/example/alpha",
+                agent: "executor",
+                provider: "nan",
+                model: "glm5.2",
+                input_tokens: 5,
+                output_tokens: 4,
+                cache_read_tokens: 0,
+                message_count: 1,
+                session_count: 1,
+                cost_microusd: Some(5),
+            }),
         ]);
 
         assert_eq!(history.oldest_day.as_deref(), Some("2026-08-16"));
@@ -868,25 +864,22 @@ mod tests {
 
     #[test]
     fn disabled_repository_marker_does_not_enable_repository_attribution() {
-        let history = aggregate_history_rows([history_row(
-            "2026-08-16",
-            REPOSITORY_ATTRIBUTION_DISABLED,
-            "reviewer",
-            "chatgpt-codex",
-            "codex",
-            8,
-            2,
-            0,
-            0,
-            0,
-            None,
-        )]);
+        let history = aggregate_history_rows([history_row(HistoryRowSpec {
+            day: "2026-08-16",
+            repository: REPOSITORY_ATTRIBUTION_DISABLED,
+            agent: "reviewer",
+            provider: "chatgpt-codex",
+            model: "codex",
+            input_tokens: 8,
+            output_tokens: 2,
+            cache_read_tokens: 0,
+            message_count: 0,
+            session_count: 0,
+            cost_microusd: None,
+        })]);
 
         assert!(!history.repository_attribution_enabled);
-        assert_eq!(
-            history.rows[0].repository,
-            REPOSITORY_ATTRIBUTION_DISABLED
-        );
+        assert_eq!(history.rows[0].repository, REPOSITORY_ATTRIBUTION_DISABLED);
     }
 
     #[test]
@@ -920,19 +913,21 @@ mod tests {
     #[test]
     fn usage_history_truncates_at_documented_row_limit() {
         let history = aggregate_history_rows((0..1_001).map(|index| {
-            history_row(
-                &format!("2026-08-{:02}", (index % 28) + 1),
-                &format!("github.com/example/repo-{index:04}"),
-                "executor",
-                "nan",
-                "qwen3.6",
-                10_000_u64.saturating_sub(index as u64),
-                0,
-                0,
-                1,
-                1,
-                None,
-            )
+            let day = format!("2026-08-{:02}", (index % 28) + 1);
+            let repository = format!("github.com/example/repo-{index:04}");
+            history_row(HistoryRowSpec {
+                day: &day,
+                repository: &repository,
+                agent: "executor",
+                provider: "nan",
+                model: "qwen3.6",
+                input_tokens: 10_000_u64.saturating_sub(index as u64),
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                message_count: 1,
+                session_count: 1,
+                cost_microusd: None,
+            })
         }));
 
         assert!(history.truncated);

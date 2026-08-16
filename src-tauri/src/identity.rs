@@ -42,6 +42,10 @@ pub fn normalize_remote_url(remote: &str) -> Option<String> {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Kept as the filesystem-backed repository identity entrypoint for future callers."
+)]
 pub fn repository_identifier(project_dir: &Path) -> String {
     let directory_name = project_dir.file_name().and_then(|name| name.to_str());
     let resolver = RepositoryResolver::new(true);
@@ -192,12 +196,12 @@ fn read_origin_remote(config_path: &Path) -> Option<String> {
             continue;
         }
 
-        if let Some((key, value)) = line.split_once('=') {
-            if key.trim().eq_ignore_ascii_case("url") {
-                let value = value.trim();
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
+        if let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("url")
+        {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
             }
         }
     }
@@ -264,24 +268,21 @@ fn normalize_host_path(host: &str, path: &str) -> Option<String> {
         return None;
     }
 
-    let normalized_path = if let Some(last) = segments.last() {
-        if last == &".git" {
-            return None;
-        } else if let Some(stripped) = last.strip_suffix(".git") {
-            if stripped.is_empty() {
-                return None;
-            }
-            let mut normalized = segments[..segments.len() - 1].join("/");
-            if !normalized.is_empty() {
-                normalized.push('/');
-            }
-            normalized.push_str(stripped);
-            normalized
-        } else {
-            segments.join("/")
-        }
-    } else {
+    let last = segments.last()?;
+    let normalized_path = if last == &".git" {
         return None;
+    } else if let Some(stripped) = last.strip_suffix(".git") {
+        if stripped.is_empty() {
+            return None;
+        }
+        let mut normalized = segments[..segments.len() - 1].join("/");
+        if !normalized.is_empty() {
+            normalized.push('/');
+        }
+        normalized.push_str(stripped);
+        normalized
+    } else {
+        segments.join("/")
     };
 
     if normalized_path.len() > 256 || host.len() + normalized_path.len() + 1 > 256 {
@@ -316,8 +317,8 @@ fn normalize_local_name(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_provider_id, normalize_remote_url, provider_label, repository_identifier,
-        repository_identifier_from_remote, RepositoryResolver,
+        RepositoryResolver, normalize_provider_id, normalize_remote_url, provider_label,
+        repository_identifier, repository_identifier_from_remote,
     };
     use std::fs;
     use std::path::{Path, PathBuf};

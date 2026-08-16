@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
-    "test:frontend": "vitest run",
+    "build": "tsc && vite build --configLoader runner",
+    "test:frontend": "vitest run --configLoader runner",
     "check": "npm run build && npm run test:rust",
     "preview": "vite preview",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",

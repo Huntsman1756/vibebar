@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "./App.css";
+import { POPOVER_OPENED_EVENT, shouldAutoRefreshOnMount } from "./appRuntime";
 import { demoSnapshot } from "./demo";
 import {
   aggregateHistoryByAgent,
@@ -442,6 +444,7 @@ function Metric({ label, value, detail, tone }: { label: string; value: string; 
 }
 
 function App() {
+  const isPopover = new URLSearchParams(window.location.search).get("view") === "popover";
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [preview, setPreview] = useState(false);
@@ -464,10 +467,43 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!shouldAutoRefreshOnMount(isPopover)) {
+      setLoading(false);
+      return;
+    }
+
     void refresh();
     const timer = window.setInterval(() => void refresh(), 60_000);
     return () => window.clearInterval(timer);
-  }, [refresh]);
+  }, [isPopover, refresh]);
+
+  useEffect(() => {
+    if (!isPopover) {
+      return;
+    }
+
+    let unlisten: UnlistenFn | null = null;
+    let disposed = false;
+    const register = async () => {
+      const cleanup = await listen(POPOVER_OPENED_EVENT, () => {
+        void refresh();
+      });
+      if (disposed) {
+        cleanup();
+      } else {
+        unlisten = cleanup;
+      }
+    };
+
+    void register();
+
+    return () => {
+      disposed = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [isPopover, refresh]);
 
   const workflow = snapshot?.workflow;
   const providers = useMemo(() => [...(snapshot?.providers ?? [])].sort((a, b) => {
@@ -481,7 +517,6 @@ function App() {
     ["chatgpt-codex", "ChatGPT · Codex"],
     ...providers.map((provider) => [provider.id, provider.label] as const),
   ]), [providers]);
-  const isPopover = new URLSearchParams(window.location.search).get("view") === "popover";
 
   if (isPopover) {
     return <PopoverDashboard snapshot={snapshot} providers={providers} loading={loading} preview={preview} error={error} refresh={refresh} providerLabels={providerLabels} historyRange={historyRange} onHistoryRangeChange={setHistoryRange} />;

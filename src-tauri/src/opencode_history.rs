@@ -5,9 +5,13 @@ use chrono::{DateTime, Days, Local, LocalResult, NaiveDate, TimeZone};
 use rusqlite::{Connection, OpenFlags};
 
 use crate::collectors::{opencode_database_path, opencode_model_identity};
-use crate::domain::{AgentUsage, TokenUsage, UsageHistory, UsageHistoryRow, aggregate_history_rows};
+use crate::domain::{
+    AgentUsage, TokenUsage, UsageHistory, UsageHistoryRow, aggregate_history_rows,
+};
 use crate::history::local_day;
-use crate::identity::{RepositoryResolver, normalize_provider_id, repository_identifier_from_remote};
+use crate::identity::{
+    RepositoryResolver, normalize_provider_id, repository_identifier_from_remote,
+};
 
 const MESSAGE_SOURCE: &str = "opencode-db-messages-31d";
 const MESSAGE_FIDELITY: &str = "metadata";
@@ -433,8 +437,12 @@ fn add_tokens(
     cache_read_tokens: i64,
     cache_write_tokens: i64,
 ) {
-    total.input_tokens = total.input_tokens.saturating_add(non_negative(input_tokens));
-    total.output_tokens = total.output_tokens.saturating_add(non_negative(output_tokens));
+    total.input_tokens = total
+        .input_tokens
+        .saturating_add(non_negative(input_tokens));
+    total.output_tokens = total
+        .output_tokens
+        .saturating_add(non_negative(output_tokens));
     total.cache_read_tokens = total
         .cache_read_tokens
         .saturating_add(non_negative(cache_read_tokens));
@@ -481,10 +489,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        MESSAGE_FIDELITY, MESSAGE_SOURCE, SESSION_FALLBACK_FIDELITY,
-        SESSION_FALLBACK_SOURCE, collect_history_from_connection,
-        collect_opencode_agents_from_connection, local_history_window_start_millis_for,
-        merge_agent_usage_sources, query_message_history, query_session_history_fallback,
+        MESSAGE_FIDELITY, MESSAGE_SOURCE, SESSION_FALLBACK_FIDELITY, SESSION_FALLBACK_SOURCE,
+        collect_history_from_connection, collect_opencode_agents_from_connection,
+        local_history_window_start_millis_for, merge_agent_usage_sources, query_message_history,
+        query_session_history_fallback,
     };
     use crate::{
         domain::{AgentUsage, TokenUsage},
@@ -501,7 +509,8 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("vibebar-opencode-history-{label}-{unique}"));
+            let path =
+                std::env::temp_dir().join(format!("vibebar-opencode-history-{label}-{unique}"));
             fs::create_dir_all(&path).unwrap();
             Self { path }
         }
@@ -591,7 +600,11 @@ mod tests {
     #[test]
     fn metadata_query_aggregates_assistant_rows_without_exposing_raw_json() {
         let repo_root = TestDir::new("repos");
-        let alpha = create_repo(repo_root.path(), "alpha", "https://github.com/example/alpha.git");
+        let alpha = create_repo(
+            repo_root.path(),
+            "alpha",
+            "https://github.com/example/alpha.git",
+        );
         let beta = create_repo(repo_root.path(), "beta", "git@github.com:example/beta.git");
 
         let connection = Connection::open_in_memory().unwrap();
@@ -742,13 +755,48 @@ mod tests {
         .to_string();
 
         for (id, session_id, time_created, data) in [
-            ("m1", "s1", local_timestamp(2026, 8, 15, 10), assistant_one.as_str()),
-            ("m2", "s1", local_timestamp(2026, 8, 15, 11), assistant_two.as_str()),
-            ("m3", "s2", local_timestamp(2026, 8, 15, 12), assistant_three.as_str()),
-            ("m4", "s3", local_timestamp(2026, 8, 16, 9), assistant_four.as_str()),
-            ("m5", "s4", local_timestamp(2026, 8, 16, 14), assistant_five.as_str()),
-            ("m6", "s5", local_timestamp(2026, 8, 15, 13), assistant_six.as_str()),
-            ("m7", "s5", local_timestamp(2026, 8, 15, 14), user_message.as_str()),
+            (
+                "m1",
+                "s1",
+                local_timestamp(2026, 8, 15, 10),
+                assistant_one.as_str(),
+            ),
+            (
+                "m2",
+                "s1",
+                local_timestamp(2026, 8, 15, 11),
+                assistant_two.as_str(),
+            ),
+            (
+                "m3",
+                "s2",
+                local_timestamp(2026, 8, 15, 12),
+                assistant_three.as_str(),
+            ),
+            (
+                "m4",
+                "s3",
+                local_timestamp(2026, 8, 16, 9),
+                assistant_four.as_str(),
+            ),
+            (
+                "m5",
+                "s4",
+                local_timestamp(2026, 8, 16, 14),
+                assistant_five.as_str(),
+            ),
+            (
+                "m6",
+                "s5",
+                local_timestamp(2026, 8, 15, 13),
+                assistant_six.as_str(),
+            ),
+            (
+                "m7",
+                "s5",
+                local_timestamp(2026, 8, 15, 14),
+                user_message.as_str(),
+            ),
         ] {
             connection
                 .execute(
@@ -802,7 +850,9 @@ mod tests {
             collect_opencode_agents_from_connection(&connection, since_millis).unwrap();
         let executor_nan = agent_usage
             .iter()
-            .find(|item| item.agent == "executor" && item.provider == "nan" && item.model == "qwen3.6")
+            .find(|item| {
+                item.agent == "executor" && item.provider == "nan" && item.model == "qwen3.6"
+            })
             .unwrap();
         assert_eq!(executor_nan.calls, 3);
         assert_eq!(executor_nan.tasks, 2);
@@ -824,7 +874,11 @@ mod tests {
     #[test]
     fn metadata_agent_usage_counts_cross_day_session_once_for_tasks() {
         let repo_root = TestDir::new("agent-cross-day");
-        let alpha = create_repo(repo_root.path(), "alpha", "https://github.com/example/alpha.git");
+        let alpha = create_repo(
+            repo_root.path(),
+            "alpha",
+            "https://github.com/example/alpha.git",
+        );
 
         let connection = Connection::open_in_memory().unwrap();
         create_history_schema(&connection);
@@ -871,11 +925,9 @@ mod tests {
                 .unwrap();
         }
 
-        let usage = collect_opencode_agents_from_connection(
-            &connection,
-            local_timestamp(2026, 8, 15, 0),
-        )
-        .unwrap();
+        let usage =
+            collect_opencode_agents_from_connection(&connection, local_timestamp(2026, 8, 15, 0))
+                .unwrap();
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].agent, "executor");
         assert_eq!(usage[0].provider, "nan");
@@ -889,7 +941,11 @@ mod tests {
     #[test]
     fn session_fallback_uses_session_aggregate_and_marks_fidelity() {
         let repo_root = TestDir::new("fallback");
-        let alpha = create_repo(repo_root.path(), "alpha", "https://github.com/example/alpha.git");
+        let alpha = create_repo(
+            repo_root.path(),
+            "alpha",
+            "https://github.com/example/alpha.git",
+        );
         let beta = create_repo(repo_root.path(), "beta", "git@github.com:example/beta.git");
 
         let connection = Connection::open_in_memory().unwrap();
@@ -956,7 +1012,8 @@ mod tests {
 
         let since_millis = local_timestamp(2026, 8, 14, 0);
         let mut resolver = RepositoryResolver::new(true);
-        let history = query_session_history_fallback(&connection, since_millis, &mut resolver).unwrap();
+        let history =
+            query_session_history_fallback(&connection, since_millis, &mut resolver).unwrap();
 
         assert_eq!(history.rows.len(), 2);
         let alpha_row = history
@@ -980,7 +1037,11 @@ mod tests {
     #[test]
     fn collect_history_falls_back_when_message_table_is_missing_and_errors_when_no_usage_exists() {
         let repo_root = TestDir::new("collect");
-        let alpha = create_repo(repo_root.path(), "alpha", "https://github.com/example/alpha.git");
+        let alpha = create_repo(
+            repo_root.path(),
+            "alpha",
+            "https://github.com/example/alpha.git",
+        );
 
         let with_fallback = Connection::open_in_memory().unwrap();
         with_fallback
@@ -1019,21 +1080,26 @@ mod tests {
 
         let since_millis = local_timestamp(2026, 8, 14, 0);
         let mut resolver = RepositoryResolver::new(true);
-        let history = collect_history_from_connection(&with_fallback, since_millis, &mut resolver).unwrap();
+        let history =
+            collect_history_from_connection(&with_fallback, since_millis, &mut resolver).unwrap();
         assert_eq!(history.rows.len(), 1);
         assert_eq!(history.rows[0].source_fidelity, SESSION_FALLBACK_FIDELITY);
 
         let empty = Connection::open_in_memory().unwrap();
         let mut empty_resolver = RepositoryResolver::new(true);
-        let error = collect_history_from_connection(&empty, since_millis, &mut empty_resolver)
-            .unwrap_err();
+        let error =
+            collect_history_from_connection(&empty, since_millis, &mut empty_resolver).unwrap_err();
         assert!(error.contains("OpenCode"));
     }
 
     #[test]
     fn successful_metadata_query_with_only_user_rows_stays_empty_and_does_not_fallback() {
         let repo_root = TestDir::new("metadata-empty");
-        let alpha = create_repo(repo_root.path(), "alpha", "https://github.com/example/alpha.git");
+        let alpha = create_repo(
+            repo_root.path(),
+            "alpha",
+            "https://github.com/example/alpha.git",
+        );
 
         let connection = Connection::open_in_memory().unwrap();
         create_history_schema(&connection);
@@ -1070,7 +1136,8 @@ mod tests {
         assert!(direct.rows.is_empty());
 
         let mut resolver = RepositoryResolver::new(true);
-        let collected = collect_history_from_connection(&connection, since_millis, &mut resolver).unwrap();
+        let collected =
+            collect_history_from_connection(&connection, since_millis, &mut resolver).unwrap();
         assert!(collected.rows.is_empty());
 
         let usage = collect_opencode_agents_from_connection(&connection, since_millis).unwrap();
@@ -1185,7 +1252,16 @@ mod tests {
         assert_eq!(merged.len(), 4);
         assert!(merged.iter().any(|item| item.provider == "chatgpt"));
         assert!(merged.iter().any(|item| item.provider == "opencode-go"));
-        assert!(!merged.iter().any(|item| item.provider == "nan" && item.source == "vibebar-events-30d"));
-        assert!(!merged.iter().any(|item| item.provider == "custom-provider" && item.source == "vibebar-events-30d"));
+        assert!(
+            !merged
+                .iter()
+                .any(|item| item.provider == "nan" && item.source == "vibebar-events-30d")
+        );
+        assert!(
+            !merged
+                .iter()
+                .any(|item| item.provider == "custom-provider"
+                    && item.source == "vibebar-events-30d")
+        );
     }
 }
