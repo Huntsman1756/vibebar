@@ -19,6 +19,24 @@
         "minWidth": 860,
         "minHeight": 620,
         "center": true
+      },
+      {
+        "label": "popover",
+        "title": "VibeBar",
+        "url": "index.html?view=popover",
+        "width": 420,
+        "height": 590,
+        "minWidth": 420,
+        "maxWidth": 420,
+        "minHeight": 590,
+        "maxHeight": 590,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "center": false,
+        "shadow": true
       }
     ],
     "security": {

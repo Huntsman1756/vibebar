@@ -24,6 +24,28 @@ struct AppState {
     refresh_lock: Arc<Mutex<()>>,
 }
 
+fn toggle_popover(
+    app: &tauri::AppHandle,
+    tray_position: Option<tauri::PhysicalPosition<f64>>,
+) {
+    let Some(popover) = app.get_webview_window("popover") else {
+        return;
+    };
+    if popover.is_visible().unwrap_or(false) {
+        let _ = popover.hide();
+        return;
+    }
+    if let Some(position) = tray_position {
+        let x = (position.x - 210.0).max(8.0) as i32;
+        let y = (position.y + 8.0).max(8.0) as i32;
+        let _ = popover.set_position(tauri::Position::Physical(
+            tauri::PhysicalPosition::new(x, y),
+        ));
+    }
+    let _ = popover.show();
+    let _ = popover.set_focus();
+}
+
 fn build_snapshot(data_dir: &std::path::Path) -> DashboardSnapshot {
     let now = Utc::now();
     let (events, mut diagnostics) = storage::read_events(data_dir);
@@ -120,6 +142,13 @@ fn telemetry_path(state: State<'_, AppState>) -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .on_window_event(|window, event| {
+            if window.label() == "popover"
+                && matches!(event, tauri::WindowEvent::Focused(false))
+            {
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             app.manage(AppState {
@@ -146,15 +175,13 @@ pub fn run() {
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
+                        position,
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
                         ..
                     } = event
                     {
-                        if let Some(window) = tray.app_handle().get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
+                        toggle_popover(tray.app_handle(), Some(position));
                     }
                 })
                 .build(app)?;
