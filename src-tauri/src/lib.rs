@@ -28,6 +28,16 @@ struct AppState {
     refresh_lock: Arc<Mutex<()>>,
 }
 
+fn opencode_session_fallback_diagnostic(agent_usage: &[domain::AgentUsage]) -> Option<String> {
+    agent_usage
+        .iter()
+        .any(|item| item.source == "opencode-db-session-31d-fallback")
+        .then(|| {
+            "OpenCode agent usage is using lower-fidelity session aggregates because assistant message metadata was unavailable."
+                .into()
+        })
+}
+
 fn toggle_popover(app: &tauri::AppHandle, tray_position: Option<tauri::PhysicalPosition<f64>>) {
     let Some(popover) = app.get_webview_window("popover") else {
         return;
@@ -93,6 +103,9 @@ fn build_snapshot(data_dir: &std::path::Path) -> DashboardSnapshot {
     let event_agent_usage = aggregate_agent_usage(&events, now - Duration::days(30));
     let agent_usage = match opencode_history::collect_opencode_agents() {
         Ok(opencode_usage) => {
+            if let Some(diagnostic) = opencode_session_fallback_diagnostic(&opencode_usage) {
+                diagnostics.push(diagnostic);
+            }
             opencode_history::merge_agent_usage_sources(opencode_usage, event_agent_usage)
         }
         Err(error) => {
@@ -149,6 +162,37 @@ fn telemetry_path(state: State<'_, AppState>) -> String {
     storage::telemetry_path(&state.data_dir)
         .display()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::opencode_session_fallback_diagnostic;
+    use crate::domain::{AgentUsage, TokenUsage};
+
+    fn usage(source: &str) -> AgentUsage {
+        AgentUsage {
+            agent: "executor".into(),
+            provider: "nan".into(),
+            model: "qwen3.6".into(),
+            source: source.into(),
+            calls: 1,
+            tasks: 1,
+            tokens: TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn session_fallback_agent_usage_produces_snapshot_diagnostic() {
+        assert!(opencode_session_fallback_diagnostic(&[usage("opencode-db-session-31d-fallback")])
+            .is_some());
+        assert!(opencode_session_fallback_diagnostic(&[usage("opencode-db-messages-31d")]).is_none());
+        assert!(opencode_session_fallback_diagnostic(&[usage("vibebar-events-30d")]).is_none());
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

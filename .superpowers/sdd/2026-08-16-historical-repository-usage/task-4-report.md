@@ -91,3 +91,80 @@ Result: no output, no whitespace errors.
 
 - Task 5 snapshot history wiring was intentionally left untouched.
 - Session-fallback diagnostics are represented through fallback source/fidelity in this task; snapshot-level diagnostic surfacing remains for the later snapshot/history wiring task.
+
+## Round 1 Fix
+
+### Review fixes applied
+
+- Reworked OpenCode DB agent aggregation so `AgentUsage` is built directly from database rows instead of daily history rows.
+- Metadata mapping now uses:
+  - `calls = assistant message count`
+  - `tasks = distinct session count across the full 31-day window`
+- Session fallback mapping now uses:
+  - `calls = session row count`
+  - `tasks = distinct session count across the full 31-day window`
+- Successful metadata queries with zero assistant rows now return an empty metadata result instead of silently switching to session fallback.
+- The OpenCode collector now uses a local-calendar boundary: local midnight 30 local days before today, inclusive of the current local day for a 31-day window.
+- `build_snapshot` now emits an explicit diagnostic when OpenCode agent usage is coming from lower-fidelity session fallback rows.
+
+### Round 1 RED evidence
+
+Focused RED command after adding the new regression tests:
+
+```sh
+rtk cargo test --manifest-path /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar/src-tauri/Cargo.toml opencode_history::tests
+```
+
+Observed failure:
+
+```text
+error[E0432]: unresolved imports `super::collect_opencode_agents_from_connection`, `super::local_history_window_start_millis_for`
+error[E0432]: unresolved import `super::opencode_session_fallback_diagnostic`
+```
+
+This confirmed the missing pieces for the review findings before implementation: no direct DB agent aggregator, no local-window helper, and no snapshot fallback diagnostic hook.
+
+### Round 1 GREEN evidence
+
+Focused history regression suite:
+
+```sh
+rtk cargo test --manifest-path /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar/src-tauri/Cargo.toml opencode_history::tests
+```
+
+Result:
+
+```text
+cargo test: 7 passed, 32 filtered out (3 suites, 0.01s)
+```
+
+Focused snapshot diagnostic test:
+
+```sh
+rtk cargo test --manifest-path /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar/src-tauri/Cargo.toml session_fallback_agent_usage_produces_snapshot_diagnostic
+```
+
+Result:
+
+```text
+cargo test: 1 passed, 38 filtered out (3 suites, 0.00s)
+```
+
+Full Rust suite:
+
+```sh
+rtk cargo test --manifest-path /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar/src-tauri/Cargo.toml
+```
+
+Result:
+
+```text
+cargo test: 39 passed (4 suites, 0.46s)
+```
+
+### Round 1 regression coverage
+
+- A single session spanning two local days now contributes `tasks = 1` for agent usage while still contributing multiple assistant-message `calls`.
+- Valid metadata schema with only user rows stays empty and does not synthesize session fallback totals.
+- The local 31-day window begins at local midnight 30 local days before the current local day.
+- Snapshot diagnostics explicitly call out lower-fidelity OpenCode session fallback when it is the source of agent usage.

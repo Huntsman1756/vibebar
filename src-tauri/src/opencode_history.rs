@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use chrono::Utc;
+use chrono::{DateTime, Days, Local, LocalResult, NaiveDate, TimeZone};
 use rusqlite::{Connection, OpenFlags};
 
 use crate::collectors::{opencode_database_path, opencode_model_identity};
@@ -13,6 +13,32 @@ const MESSAGE_SOURCE: &str = "opencode-db-messages-31d";
 const MESSAGE_FIDELITY: &str = "metadata";
 const SESSION_FALLBACK_SOURCE: &str = "opencode-db-session-31d-fallback";
 const SESSION_FALLBACK_FIDELITY: &str = "session-fallback";
+
+struct MessageMetadataRecord {
+    time_created: i64,
+    agent: String,
+    model: String,
+    provider: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    cost_microusd: Option<f64>,
+    session_id: String,
+    directory: String,
+}
+
+struct SessionAggregateRecord {
+    time_updated: i64,
+    session_id: String,
+    directory: String,
+    agent: String,
+    raw_model: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+}
 
 struct HistoryAccumulator {
     message_count: u64,
@@ -37,25 +63,44 @@ impl Default for HistoryAccumulator {
     }
 }
 
+struct AgentUsageAccumulator {
+    calls: u64,
+    tokens: TokenUsage,
+    sessions: HashSet<String>,
+}
+
+impl Default for AgentUsageAccumulator {
+    fn default() -> Self {
+        Self {
+            calls: 0,
+            tokens: TokenUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            sessions: HashSet::new(),
+        }
+    }
+}
+
 type HistoryKey = (String, String, String, String, String, String, String);
+type AgentKey = (String, String, String, String);
 
 pub fn collect_opencode_history() -> Result<UsageHistory, String> {
     let path = opencode_database_path().ok_or("OpenCode history database is unavailable")?;
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|_| "OpenCode history database cannot be opened read-only".to_string())?;
-    let since_millis = (Utc::now() - chrono::Duration::days(30)).timestamp_millis();
+    let since_millis = local_history_window_start_millis();
     let mut resolver = RepositoryResolver::new(true);
     collect_history_from_connection(&connection, since_millis, &mut resolver)
 }
 
 pub fn collect_opencode_agents() -> Result<Vec<AgentUsage>, String> {
-    let history = collect_opencode_history()?;
-    let usage = agent_usage_from_history(&history);
-    if usage.is_empty() {
-        Err("OpenCode history database has no agent usage in the last 31 days".into())
-    } else {
-        Ok(usage)
-    }
+    let path = opencode_database_path().ok_or("OpenCode history database is unavailable")?;
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "OpenCode history database cannot be opened read-only".to_string())?;
+    collect_opencode_agents_from_connection(&connection, local_history_window_start_millis())
 }
 
 pub fn query_message_history(
@@ -63,80 +108,28 @@ pub fn query_message_history(
     since_millis: i64,
     resolver: &mut RepositoryResolver,
 ) -> Result<UsageHistory, String> {
-    let mut statement = connection
-        .prepare(
-            "SELECT
-                m.time_created,
-                COALESCE(json_extract(m.data, '$.agent'), s.agent, 'Sin identificar'),
-                COALESCE(json_extract(m.data, '$.modelID'), json_extract(s.model, '$.id'), ''),
-                COALESCE(json_extract(m.data, '$.providerID'), json_extract(s.model, '$.providerID'), 'opencode'),
-                COALESCE(json_extract(m.data, '$.tokens.input'), 0),
-                COALESCE(json_extract(m.data, '$.tokens.output'), 0),
-                COALESCE(json_extract(m.data, '$.tokens.cache.read'), 0),
-                COALESCE(json_extract(m.data, '$.tokens.cache.write'), 0),
-                json_extract(m.data, '$.cost'),
-                m.session_id,
-                s.directory
-             FROM message m
-             JOIN session s ON s.id = m.session_id
-             WHERE m.time_created >= ?1
-               AND json_extract(m.data, '$.role') = 'assistant'",
-        )
-        .map_err(|error| format!("OpenCode assistant metadata query failed: {error}"))?;
-
-    let rows = statement
-        .query_map([since_millis], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, Option<f64>>(8)?,
-                row.get::<_, String>(9)?,
-                row.get::<_, String>(10)?,
-            ))
-        })
-        .map_err(|error| format!("OpenCode assistant metadata query failed: {error}"))?;
-
     let mut grouped: BTreeMap<HistoryKey, HistoryAccumulator> = BTreeMap::new();
-    for row in rows {
-        let (
-            time_created,
-            agent,
-            model,
-            provider,
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            cost,
-            session_id,
-            directory,
-        ) = row.map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?;
+    for record in query_message_records(connection, since_millis)? {
         let key = (
-            local_day(time_created),
-            resolve_repository(&directory, resolver),
-            agent,
-            normalize_provider_id(&provider),
-            model,
+            local_day(record.time_created),
+            resolve_repository(&record.directory, resolver),
+            record.agent,
+            normalize_provider_id(&record.provider),
+            record.model,
             MESSAGE_SOURCE.into(),
             MESSAGE_FIDELITY.into(),
         );
         let entry = grouped.entry(key).or_default();
         entry.message_count = entry.message_count.saturating_add(1);
-        entry.sessions.insert(session_id);
+        entry.sessions.insert(record.session_id);
         add_tokens(
             &mut entry.tokens,
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
+            record.input_tokens,
+            record.output_tokens,
+            record.cache_read_tokens,
+            record.cache_write_tokens,
         );
-        if let Some(cost) = cost.and_then(f64_to_u64) {
+        if let Some(cost) = record.cost_microusd.and_then(f64_to_u64) {
             entry.cost_microusd = Some(entry.cost_microusd.unwrap_or(0).saturating_add(cost));
         }
     }
@@ -149,70 +142,26 @@ pub fn query_session_history_fallback(
     since_millis: i64,
     resolver: &mut RepositoryResolver,
 ) -> Result<UsageHistory, String> {
-    let mut statement = connection
-        .prepare(
-            "SELECT
-                time_updated,
-                id,
-                COALESCE(directory, ''),
-                COALESCE(agent, 'Sin identificar'),
-                COALESCE(model, ''),
-                COALESCE(tokens_input, 0),
-                COALESCE(tokens_output, 0),
-                COALESCE(tokens_cache_read, 0),
-                COALESCE(tokens_cache_write, 0)
-             FROM session
-             WHERE time_updated >= ?1",
-        )
-        .map_err(|error| format!("OpenCode session fallback query failed: {error}"))?;
-
-    let rows = statement
-        .query_map([since_millis], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, i64>(8)?,
-            ))
-        })
-        .map_err(|error| format!("OpenCode session fallback query failed: {error}"))?;
-
     let mut grouped: BTreeMap<HistoryKey, HistoryAccumulator> = BTreeMap::new();
-    for row in rows {
-        let (
-            time_updated,
-            session_id,
-            directory,
-            agent,
-            raw_model,
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-        ) = row.map_err(|error| format!("OpenCode session fallback row was invalid: {error}"))?;
-        let (provider, model) = opencode_model_identity(&raw_model);
+    for record in query_session_records(connection, since_millis)? {
+        let (provider, model) = opencode_model_identity(&record.raw_model);
         let key = (
-            local_day(time_updated),
-            resolve_repository(&directory, resolver),
-            agent,
+            local_day(record.time_updated),
+            resolve_repository(&record.directory, resolver),
+            record.agent,
             provider,
             model,
             SESSION_FALLBACK_SOURCE.into(),
             SESSION_FALLBACK_FIDELITY.into(),
         );
         let entry = grouped.entry(key).or_default();
-        entry.sessions.insert(session_id);
+        entry.sessions.insert(record.session_id);
         add_tokens(
             &mut entry.tokens,
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
+            record.input_tokens,
+            record.output_tokens,
+            record.cache_read_tokens,
+            record.cache_write_tokens,
         );
     }
 
@@ -225,8 +174,8 @@ fn collect_history_from_connection(
     resolver: &mut RepositoryResolver,
 ) -> Result<UsageHistory, String> {
     match query_message_history(connection, since_millis, resolver) {
-        Ok(history) if !history.rows.is_empty() => Ok(history),
-        Ok(_) | Err(_) => {
+        Ok(history) => Ok(history),
+        Err(_) => {
             let fallback = query_session_history_fallback(connection, since_millis, resolver)?;
             if fallback.rows.is_empty() {
                 Err("OpenCode history database has no usage rows in the last 31 days".into())
@@ -237,57 +186,21 @@ fn collect_history_from_connection(
     }
 }
 
-fn agent_usage_from_history(history: &UsageHistory) -> Vec<AgentUsage> {
-    let mut grouped: BTreeMap<(String, String, String, String), AgentUsage> = BTreeMap::new();
-    for row in &history.rows {
-        let key = (
-            row.agent.clone(),
-            row.provider.clone(),
-            row.model.clone(),
-            row.source.clone(),
-        );
-        let entry = grouped.entry(key).or_insert_with(|| AgentUsage {
-            agent: row.agent.clone(),
-            provider: row.provider.clone(),
-            model: row.model.clone(),
-            source: row.source.clone(),
-            calls: 0,
-            tasks: 0,
-            tokens: TokenUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-            },
-        });
-        let calls = if row.source_fidelity == SESSION_FALLBACK_FIDELITY {
-            row.session_count
-        } else {
-            row.message_count
-        };
-        entry.calls = entry.calls.saturating_add(calls);
-        entry.tasks = entry.tasks.saturating_add(row.session_count);
-        entry.tokens.input_tokens = entry
-            .tokens
-            .input_tokens
-            .saturating_add(row.tokens.input_tokens);
-        entry.tokens.output_tokens = entry
-            .tokens
-            .output_tokens
-            .saturating_add(row.tokens.output_tokens);
-        entry.tokens.cache_read_tokens = entry
-            .tokens
-            .cache_read_tokens
-            .saturating_add(row.tokens.cache_read_tokens);
-        entry.tokens.cache_write_tokens = entry
-            .tokens
-            .cache_write_tokens
-            .saturating_add(row.tokens.cache_write_tokens);
+fn collect_opencode_agents_from_connection(
+    connection: &Connection,
+    since_millis: i64,
+) -> Result<Vec<AgentUsage>, String> {
+    match query_message_agent_usage(connection, since_millis) {
+        Ok(usage) => Ok(usage),
+        Err(_) => {
+            let fallback = query_session_agent_usage_fallback(connection, since_millis)?;
+            if fallback.is_empty() {
+                Err("OpenCode history database has no agent usage in the last 31 days".into())
+            } else {
+                Ok(fallback)
+            }
+        }
     }
-
-    let mut usage = grouped.into_values().collect::<Vec<_>>();
-    sort_agent_usage(&mut usage);
-    usage
 }
 
 pub fn merge_agent_usage_sources(
@@ -322,6 +235,185 @@ fn history_from_grouped_rows(grouped: BTreeMap<HistoryKey, HistoryAccumulator>) 
         tokens: value.tokens,
         cost_microusd: value.cost_microusd,
     }))
+}
+
+fn query_message_records(
+    connection: &Connection,
+    since_millis: i64,
+) -> Result<Vec<MessageMetadataRecord>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT
+                m.time_created,
+                COALESCE(json_extract(m.data, '$.agent'), s.agent, 'Sin identificar'),
+                COALESCE(json_extract(m.data, '$.modelID'), json_extract(s.model, '$.id'), ''),
+                COALESCE(json_extract(m.data, '$.providerID'), json_extract(s.model, '$.providerID'), 'opencode'),
+                COALESCE(json_extract(m.data, '$.tokens.input'), 0),
+                COALESCE(json_extract(m.data, '$.tokens.output'), 0),
+                COALESCE(json_extract(m.data, '$.tokens.cache.read'), 0),
+                COALESCE(json_extract(m.data, '$.tokens.cache.write'), 0),
+                json_extract(m.data, '$.cost'),
+                m.session_id,
+                s.directory
+             FROM message m
+             JOIN session s ON s.id = m.session_id
+             WHERE m.time_created >= ?1
+               AND json_extract(m.data, '$.role') = 'assistant'",
+        )
+        .map_err(|error| format!("OpenCode assistant metadata query failed: {error}"))?;
+
+    let rows = statement
+        .query_map([since_millis], |row| {
+            Ok(MessageMetadataRecord {
+                time_created: row.get(0)?,
+                agent: row.get(1)?,
+                model: row.get(2)?,
+                provider: row.get(3)?,
+                input_tokens: row.get(4)?,
+                output_tokens: row.get(5)?,
+                cache_read_tokens: row.get(6)?,
+                cache_write_tokens: row.get(7)?,
+                cost_microusd: row.get(8)?,
+                session_id: row.get(9)?,
+                directory: row.get(10)?,
+            })
+        })
+        .map_err(|error| format!("OpenCode assistant metadata query failed: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))
+}
+
+fn query_session_records(
+    connection: &Connection,
+    since_millis: i64,
+) -> Result<Vec<SessionAggregateRecord>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT
+                time_updated,
+                id,
+                COALESCE(directory, ''),
+                COALESCE(agent, 'Sin identificar'),
+                COALESCE(model, ''),
+                COALESCE(tokens_input, 0),
+                COALESCE(tokens_output, 0),
+                COALESCE(tokens_cache_read, 0),
+                COALESCE(tokens_cache_write, 0)
+             FROM session
+             WHERE time_updated >= ?1",
+        )
+        .map_err(|error| format!("OpenCode session fallback query failed: {error}"))?;
+
+    let rows = statement
+        .query_map([since_millis], |row| {
+            Ok(SessionAggregateRecord {
+                time_updated: row.get(0)?,
+                session_id: row.get(1)?,
+                directory: row.get(2)?,
+                agent: row.get(3)?,
+                raw_model: row.get(4)?,
+                input_tokens: row.get(5)?,
+                output_tokens: row.get(6)?,
+                cache_read_tokens: row.get(7)?,
+                cache_write_tokens: row.get(8)?,
+            })
+        })
+        .map_err(|error| format!("OpenCode session fallback query failed: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("OpenCode session fallback row was invalid: {error}"))
+}
+
+fn query_message_agent_usage(
+    connection: &Connection,
+    since_millis: i64,
+) -> Result<Vec<AgentUsage>, String> {
+    let mut grouped: BTreeMap<AgentKey, AgentUsageAccumulator> = BTreeMap::new();
+    for record in query_message_records(connection, since_millis)? {
+        let key = (
+            record.agent,
+            normalize_provider_id(&record.provider),
+            record.model,
+            MESSAGE_SOURCE.into(),
+        );
+        let entry = grouped.entry(key).or_default();
+        entry.calls = entry.calls.saturating_add(1);
+        entry.sessions.insert(record.session_id);
+        add_tokens(
+            &mut entry.tokens,
+            record.input_tokens,
+            record.output_tokens,
+            record.cache_read_tokens,
+            record.cache_write_tokens,
+        );
+    }
+    Ok(agent_usage_from_grouped(grouped))
+}
+
+fn query_session_agent_usage_fallback(
+    connection: &Connection,
+    since_millis: i64,
+) -> Result<Vec<AgentUsage>, String> {
+    let mut grouped: BTreeMap<AgentKey, AgentUsageAccumulator> = BTreeMap::new();
+    for record in query_session_records(connection, since_millis)? {
+        let (provider, model) = opencode_model_identity(&record.raw_model);
+        let key = (
+            record.agent,
+            provider,
+            model,
+            SESSION_FALLBACK_SOURCE.into(),
+        );
+        let entry = grouped.entry(key).or_default();
+        entry.calls = entry.calls.saturating_add(1);
+        entry.sessions.insert(record.session_id);
+        add_tokens(
+            &mut entry.tokens,
+            record.input_tokens,
+            record.output_tokens,
+            record.cache_read_tokens,
+            record.cache_write_tokens,
+        );
+    }
+    Ok(agent_usage_from_grouped(grouped))
+}
+
+fn agent_usage_from_grouped(grouped: BTreeMap<AgentKey, AgentUsageAccumulator>) -> Vec<AgentUsage> {
+    let mut usage = grouped
+        .into_iter()
+        .map(|(key, value)| AgentUsage {
+            agent: key.0,
+            provider: key.1,
+            model: key.2,
+            source: key.3,
+            calls: value.calls,
+            tasks: value.sessions.len() as u64,
+            tokens: value.tokens,
+        })
+        .collect::<Vec<_>>();
+    sort_agent_usage(&mut usage);
+    usage
+}
+
+fn local_history_window_start_millis() -> i64 {
+    local_history_window_start_millis_for(Local::now())
+}
+
+fn local_history_window_start_millis_for(now: DateTime<Local>) -> i64 {
+    local_midnight_millis(now.date_naive() - Days::new(30))
+}
+
+fn local_midnight_millis(day: NaiveDate) -> i64 {
+    let naive = day.and_hms_opt(0, 0, 0).expect("valid local midnight");
+    match Local.from_local_datetime(&naive) {
+        LocalResult::Single(datetime) => datetime.timestamp_millis(),
+        LocalResult::Ambiguous(earliest, _) => earliest.timestamp_millis(),
+        LocalResult::None => Local
+            .from_local_datetime(&(naive + chrono::Duration::hours(1)))
+            .earliest()
+            .expect("local day start should exist")
+            .timestamp_millis(),
+    }
 }
 
 fn resolve_repository(directory: &str, resolver: &RepositoryResolver) -> String {
@@ -390,7 +482,8 @@ mod tests {
 
     use super::{
         MESSAGE_FIDELITY, MESSAGE_SOURCE, SESSION_FALLBACK_FIDELITY,
-        SESSION_FALLBACK_SOURCE, agent_usage_from_history, collect_history_from_connection,
+        SESSION_FALLBACK_SOURCE, collect_history_from_connection,
+        collect_opencode_agents_from_connection, local_history_window_start_millis_for,
         merge_agent_usage_sources, query_message_history, query_session_history_fallback,
     };
     use crate::{
@@ -465,6 +558,32 @@ mod tests {
                   data TEXT
                 );
                 "#,
+            )
+            .unwrap();
+    }
+
+    fn insert_session(
+        connection: &Connection,
+        id: &str,
+        directory: &Path,
+        agent: &str,
+        model: &str,
+        time_updated: i64,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (
+                    id,
+                    directory.display().to_string(),
+                    agent,
+                    model,
+                    time_updated,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                ),
             )
             .unwrap();
     }
@@ -679,7 +798,8 @@ mod tests {
         }));
         assert!(history.rows.iter().all(|row| row.tokens.billable() < 500));
 
-        let agent_usage = agent_usage_from_history(&history);
+        let agent_usage =
+            collect_opencode_agents_from_connection(&connection, since_millis).unwrap();
         let executor_nan = agent_usage
             .iter()
             .find(|item| item.agent == "executor" && item.provider == "nan" && item.model == "qwen3.6")
@@ -699,6 +819,71 @@ mod tests {
         let serialized_agents = serde_json::to_string(&agent_usage).unwrap();
         assert!(!serialized_agents.contains("secret prompt"));
         assert!(!serialized_agents.contains("\"toolCalls\""));
+    }
+
+    #[test]
+    fn metadata_agent_usage_counts_cross_day_session_once_for_tasks() {
+        let repo_root = TestDir::new("agent-cross-day");
+        let alpha = create_repo(repo_root.path(), "alpha", "https://github.com/example/alpha.git");
+
+        let connection = Connection::open_in_memory().unwrap();
+        create_history_schema(&connection);
+        insert_session(
+            &connection,
+            "s1",
+            &alpha,
+            "executor",
+            r#"{"id":"qwen3.6","providerID":"nan"}"#,
+            local_timestamp(2026, 8, 16, 9),
+        );
+
+        for (id, time_created, data) in [
+            (
+                "m1",
+                local_timestamp(2026, 8, 15, 23),
+                json!({
+                    "role": "assistant",
+                    "agent": "executor",
+                    "modelID": "qwen3.6",
+                    "providerID": "nan",
+                    "tokens": { "input": 10, "output": 2, "cache": { "read": 1, "write": 0 } }
+                })
+                .to_string(),
+            ),
+            (
+                "m2",
+                local_timestamp(2026, 8, 16, 1),
+                json!({
+                    "role": "assistant",
+                    "agent": "executor",
+                    "modelID": "qwen3.6",
+                    "providerID": "nan",
+                    "tokens": { "input": 4, "output": 1, "cache": { "read": 0, "write": 1 } }
+                })
+                .to_string(),
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                    (id, "s1", time_created, data),
+                )
+                .unwrap();
+        }
+
+        let usage = collect_opencode_agents_from_connection(
+            &connection,
+            local_timestamp(2026, 8, 15, 0),
+        )
+        .unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].agent, "executor");
+        assert_eq!(usage[0].provider, "nan");
+        assert_eq!(usage[0].model, "qwen3.6");
+        assert_eq!(usage[0].calls, 2);
+        assert_eq!(usage[0].tasks, 1);
+        assert_eq!(usage[0].tokens.billable(), 17);
+        assert_eq!(usage[0].tokens.cache(), 2);
     }
 
     #[test]
@@ -843,6 +1028,66 @@ mod tests {
         let error = collect_history_from_connection(&empty, since_millis, &mut empty_resolver)
             .unwrap_err();
         assert!(error.contains("OpenCode"));
+    }
+
+    #[test]
+    fn successful_metadata_query_with_only_user_rows_stays_empty_and_does_not_fallback() {
+        let repo_root = TestDir::new("metadata-empty");
+        let alpha = create_repo(repo_root.path(), "alpha", "https://github.com/example/alpha.git");
+
+        let connection = Connection::open_in_memory().unwrap();
+        create_history_schema(&connection);
+        insert_session(
+            &connection,
+            "s1",
+            &alpha,
+            "executor",
+            r#"{"id":"qwen3.6","providerID":"nan"}"#,
+            local_timestamp(2026, 8, 16, 9),
+        );
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                (
+                    "m1",
+                    "s1",
+                    local_timestamp(2026, 8, 16, 10),
+                    json!({
+                        "role": "user",
+                        "agent": "executor",
+                        "modelID": "qwen3.6",
+                        "providerID": "nan",
+                        "tokens": { "input": 999, "output": 999, "cache": { "read": 999, "write": 999 } }
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+
+        let since_millis = local_timestamp(2026, 8, 15, 0);
+        let mut resolver = RepositoryResolver::new(true);
+        let direct = query_message_history(&connection, since_millis, &mut resolver).unwrap();
+        assert!(direct.rows.is_empty());
+
+        let mut resolver = RepositoryResolver::new(true);
+        let collected = collect_history_from_connection(&connection, since_millis, &mut resolver).unwrap();
+        assert!(collected.rows.is_empty());
+
+        let usage = collect_opencode_agents_from_connection(&connection, since_millis).unwrap();
+        assert!(usage.is_empty());
+    }
+
+    #[test]
+    fn local_history_window_starts_at_local_midnight_thirty_days_before_today() {
+        let now = Local
+            .with_ymd_and_hms(2026, 8, 16, 12, 0, 0)
+            .single()
+            .unwrap();
+
+        assert_eq!(
+            local_history_window_start_millis_for(now),
+            local_timestamp(2026, 7, 17, 0)
+        );
     }
 
     #[test]
