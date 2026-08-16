@@ -8,4 +8,4 @@ export type UsageHistoryRow = { day: string; repository: string; agent: string; 
 export type UsageHistory = { rows: UsageHistoryRow[]; oldestDay: string | null; newestDay: string | null; truncated: boolean; repositoryAttributionEnabled: boolean };
 export type WorkflowMetrics = { tasks: number; acceptedTasks: number; attempts: number; attemptsPerAccepted: number | null; acceptanceRate: number | null; reviewerRejections: number; mechanicalFailures: number; escalations: number; costPerAcceptedMicrousd: number | null };
 export type RecentEvent = { occurredAt: string; provider: string; model: string; role: string; taskId: string; kind: string };
-export type DashboardSnapshot = { generatedAt: string; telemetryPath: string; providers: ProviderSnapshot[]; agentUsage: AgentUsage[]; usageHistory?: UsageHistory; workflow: WorkflowMetrics; recentEvents: RecentEvent[]; diagnostics: string[] };
+export type DashboardSnapshot = { generatedAt: string; telemetryPath: string; providers: ProviderSnapshot[]; agentUsage: AgentUsage[]; usageHistory: UsageHistory; workflow: WorkflowMetrics; recentEvents: RecentEvent[]; diagnostics: string[] };

@@ -17,11 +17,22 @@ export const demoSnapshot: DashboardSnapshot = {
     ], windows: [], updatedAt: now.toISOString(), error: null },
   ],
   agentUsage: [
-    { agent: "executor", provider: "nan", model: "qwen3.6", source: "opencode-db-30d", calls: 31, tasks: 22, tokens: { inputTokens: 38_400_000, outputTokens: 1_700_000, cacheReadTokens: 94_000_000, cacheWriteTokens: 0 } },
+    { agent: "executor", provider: "nan", model: "qwen3.6", source: "opencode-db-messages-31d", calls: 31, tasks: 22, tokens: { inputTokens: 38_400_000, outputTokens: 1_700_000, cacheReadTokens: 94_000_000, cacheWriteTokens: 0 } },
     { agent: "reviewer", provider: "chatgpt", model: "codex", source: "vibebar-events-30d", calls: 18, tasks: 17, tokens: { inputTokens: 8_900_000, outputTokens: 1_200_000, cacheReadTokens: 21_000_000, cacheWriteTokens: 0 } },
     { agent: "escalationExecutor", provider: "nan", model: "deepseek-v4-flash", source: "vibebar-events-30d", calls: 12, tasks: 8, tokens: { inputTokens: 4_700_000, outputTokens: 500_000, cacheReadTokens: 6_000_000, cacheWriteTokens: 0 } },
   ],
-  usageHistory: { rows: [], oldestDay: null, newestDay: null, truncated: false, repositoryAttributionEnabled: false },
+  usageHistory: {
+    rows: [
+      { day: "2026-08-16", repository: "github.com/example/alpha", agent: "executor", provider: "nan", model: "qwen3.6", source: "opencode-db-messages-31d", sourceFidelity: "metadata", messageCount: 14, sessionCount: 4, tokens: { inputTokens: 9_800_000, outputTokens: 440_000, cacheReadTokens: 21_000_000, cacheWriteTokens: 0 }, costMicrousd: 420_000 },
+      { day: "2026-08-15", repository: "github.com/example/beta", agent: "executor", provider: "opencode-go", model: "qwen3.6", source: "opencode-db-messages-31d", sourceFidelity: "metadata", messageCount: 7, sessionCount: 2, tokens: { inputTokens: 3_600_000, outputTokens: 180_000, cacheReadTokens: 4_200_000, cacheWriteTokens: 0 }, costMicrousd: 110_000 },
+      { day: "2026-08-14", repository: "local/demo-project", agent: "reviewer", provider: "custom-provider", model: "glm5.2", source: "opencode-db-session-31d-fallback", sourceFidelity: "session-fallback", messageCount: 0, sessionCount: 3, tokens: { inputTokens: 1_100_000, outputTokens: 95_000, cacheReadTokens: 0, cacheWriteTokens: 32_000 }, costMicrousd: null },
+      { day: "2026-08-16", repository: "Repository attribution disabled", agent: "reviewer", provider: "chatgpt-codex", model: "codex", source: "vibebar-events-31d", sourceFidelity: "event-fallback", messageCount: 0, sessionCount: 0, tokens: { inputTokens: 620_000, outputTokens: 84_000, cacheReadTokens: 0, cacheWriteTokens: 0 }, costMicrousd: null },
+    ],
+    oldestDay: "2026-08-14",
+    newestDay: "2026-08-16",
+    truncated: false,
+    repositoryAttributionEnabled: true,
+  },
   workflow: { tasks: 42, acceptedTasks: 36, attempts: 61, attemptsPerAccepted: 1.69, acceptanceRate: 0.857, reviewerRejections: 17, mechanicalFailures: 3, escalations: 8, costPerAcceptedMicrousd: 0 },
   recentEvents: [
     { occurredAt: new Date(now.getTime() - 120_000).toISOString(), provider: "chatgpt", model: "codex", role: "reviewer", taskId: "runtime-482", kind: "review_accepted" },

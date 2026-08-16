@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub const REPOSITORY_ATTRIBUTION_DISABLED: &str = "Repository attribution disabled";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsage {
@@ -435,7 +437,9 @@ pub fn aggregate_history_rows(rows: impl IntoIterator<Item = UsageHistoryRow>) -
 
     let oldest_day = grouped.values().map(|row| row.day.as_str()).min().map(str::to_owned);
     let newest_day = grouped.values().map(|row| row.day.as_str()).max().map(str::to_owned);
-    let repository_attribution_enabled = grouped.values().any(|row| !row.repository.is_empty());
+    let repository_attribution_enabled = grouped.values().any(|row| {
+        !row.repository.is_empty() && row.repository != REPOSITORY_ATTRIBUTION_DISABLED
+    });
 
     let mut rows = grouped.into_values().collect::<Vec<_>>();
     rows.sort_by(|left, right| {
@@ -860,6 +864,57 @@ mod tests {
         assert_eq!(history.newest_day, None);
         assert!(!history.truncated);
         assert!(!history.repository_attribution_enabled);
+    }
+
+    #[test]
+    fn disabled_repository_marker_does_not_enable_repository_attribution() {
+        let history = aggregate_history_rows([history_row(
+            "2026-08-16",
+            REPOSITORY_ATTRIBUTION_DISABLED,
+            "reviewer",
+            "chatgpt-codex",
+            "codex",
+            8,
+            2,
+            0,
+            0,
+            0,
+            None,
+        )]);
+
+        assert!(!history.repository_attribution_enabled);
+        assert_eq!(
+            history.rows[0].repository,
+            REPOSITORY_ATTRIBUTION_DISABLED
+        );
+    }
+
+    #[test]
+    fn dashboard_snapshot_deserializes_missing_usage_history_for_older_payloads() {
+        let snapshot = serde_json::from_value::<DashboardSnapshot>(serde_json::json!({
+            "generatedAt": "2026-08-16T12:00:00Z",
+            "telemetryPath": "/tmp/events-v1.jsonl",
+            "providers": [],
+            "agentUsage": [],
+            "workflow": {
+                "tasks": 0,
+                "acceptedTasks": 0,
+                "attempts": 0,
+                "attemptsPerAccepted": null,
+                "acceptanceRate": null,
+                "reviewerRejections": 0,
+                "mechanicalFailures": 0,
+                "escalations": 0,
+                "costPerAcceptedMicrousd": null
+            },
+            "recentEvents": [],
+            "diagnostics": []
+        }))
+        .unwrap();
+
+        assert!(snapshot.usage_history.rows.is_empty());
+        assert!(!snapshot.usage_history.truncated);
+        assert!(!snapshot.usage_history.repository_attribution_enabled);
     }
 
     #[test]
