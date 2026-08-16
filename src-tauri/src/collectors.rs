@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc,
     thread,
@@ -12,22 +13,57 @@ use regex::Regex;
 use serde_json::{Value, json};
 use wait_timeout::ChildExt;
 
-use crate::domain::{ModelUsage, ProviderSnapshot, QuotaWindow, TokenUsage};
+use crate::domain::{ModelQuota, ModelUsage, ProviderSnapshot, QuotaWindow, TokenUsage};
 
 const MAX_COLLECTOR_OUTPUT: u64 = 8 * 1024 * 1024;
 
+fn resolve_program(program: &str) -> PathBuf {
+    let mut candidates = Vec::new();
+    let program_path = Path::new(program);
+    if program_path.is_absolute() {
+        candidates.push(program_path.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|directory| directory.join(program)));
+    }
+    if let Some(home) = dirs::home_dir() {
+        for directory in [".local/bin", ".cargo/bin", ".bun/bin", "bin"] {
+            candidates.push(home.join(directory).join(program));
+        }
+        #[cfg(target_os = "macos")]
+        candidates.push(
+            home.join("Applications/ChatGPT.app/Contents/Resources")
+                .join(program),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        candidates
+            .push(PathBuf::from("/Applications/ChatGPT.app/Contents/Resources").join(program));
+    }
+    for directory in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        candidates.push(Path::new(directory).join(program));
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from(program))
+}
+
 fn fixed_command(program: &str, args: &[&str]) -> Command {
+    let executable = resolve_program(program);
     #[cfg(target_os = "windows")]
     {
         let mut command = Command::new("cmd");
-        command.args(["/D", "/S", "/C", program]);
+        command.args(["/D", "/S", "/C"]);
+        command.arg(executable);
         command.args(args);
         sanitize_environment(&mut command);
         command
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let mut command = Command::new(program);
+        let mut command = Command::new(executable);
         command.args(args);
         sanitize_environment(&mut command);
         command
@@ -143,8 +179,8 @@ pub fn parse_opencode_stats(output: &str) -> Result<Vec<ProviderSnapshot>, Strin
                             cache_write_tokens: 0,
                         },
                         quota_tokens: quota_for(provider, model),
-                        quota_label: quota_for(provider, model)
-                            .map(|_| "documented monthly allowance".into()),
+                        quota_label: quota_label_for(provider, model),
+                        quota_windows: Vec::new(),
                     });
             }
             continue;
@@ -168,6 +204,9 @@ pub fn parse_opencode_stats(output: &str) -> Result<Vec<ProviderSnapshot>, Strin
             _ => {}
         }
     }
+    for ((provider, model), usage) in &mut usages {
+        usage.quota_windows = quota_windows_for(provider, model, usage.tokens.billable());
+    }
     if usages.is_empty() {
         return Err("OpenCode returned no model usage".into());
     }
@@ -179,7 +218,7 @@ pub fn parse_opencode_stats(output: &str) -> Result<Vec<ProviderSnapshot>, Strin
     Ok(grouped
         .into_iter()
         .map(|(provider, mut models)| {
-            models.sort_by_key(|model| std::cmp::Reverse(model.tokens.total()));
+            models.sort_by_key(|model| std::cmp::Reverse(model.tokens.billable()));
             let calls = models.iter().map(|model| model.calls).sum();
             let tokens = sum_tokens(models.iter().map(|model| &model.tokens));
             ProviderSnapshot {
@@ -205,7 +244,69 @@ fn quota_for(provider: &str, model: &str) -> Option<u64> {
     ) {
         ("nan", "deepseek-v4-flash") => Some(500_000_000),
         ("nan", "mimo-v2.5") => Some(1_000_000_000),
+        ("nan", "glm5.2") => Some(3_000_000_000),
         _ => None,
+    }
+}
+
+fn quota_label_for(provider: &str, model: &str) -> Option<String> {
+    match (
+        provider.to_ascii_lowercase().as_str(),
+        model.to_ascii_lowercase().as_str(),
+    ) {
+        ("nan", "deepseek-v4-flash") | ("nan", "mimo-v2.5") => {
+            Some("documented monthly allowance".into())
+        }
+        ("nan", "glm5.2") => Some("documented billing-period allowance".into()),
+        _ => None,
+    }
+}
+
+pub fn quota_windows_for(provider: &str, model: &str, billable_tokens: u64) -> Vec<ModelQuota> {
+    let monthly_window = |label: &str, quota_tokens: u64, period_label: &str| {
+        let used_percent = billable_tokens as f64 / quota_tokens as f64 * 100.0;
+        ModelQuota {
+            label: label.into(),
+            quota_tokens,
+            used_percent: Some(used_percent),
+            remaining_percent: Some((100.0 - used_percent).max(0.0)),
+            resets_at: None,
+            duration_minutes: None,
+            period_label: period_label.into(),
+        }
+    };
+    match (
+        provider.to_ascii_lowercase().as_str(),
+        model.to_ascii_lowercase().as_str(),
+    ) {
+        ("nan", "deepseek-v4-flash") => vec![monthly_window(
+            "Monthly",
+            500_000_000,
+            "30-day observed / published monthly allowance",
+        )],
+        ("nan", "mimo-v2.5") => vec![monthly_window(
+            "Monthly",
+            1_000_000_000,
+            "30-day observed / published monthly allowance",
+        )],
+        ("nan", "glm5.2") => vec![
+            monthly_window(
+                "Billing period",
+                3_000_000_000,
+                "30-day observed / published billing-period allowance",
+            ),
+            ModelQuota {
+                label: "Rolling 4h".into(),
+                quota_tokens: 400_000_000,
+                used_percent: None,
+                remaining_percent: None,
+                resets_at: None,
+                duration_minutes: Some(240),
+                period_label: "Published limit; local 30-day source cannot meter this window"
+                    .into(),
+            },
+        ],
+        _ => Vec::new(),
     }
 }
 
@@ -323,31 +424,62 @@ pub fn collect_codex_rate_limits() -> Result<ProviderSnapshot, String> {
     let mut stdin = child.stdin.take().ok_or("Codex stdin unavailable")?;
     let stdout = child.stdout.take().ok_or("Codex stdout unavailable")?;
     let initialize = json!({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "vibebar", "title": "VibeBar", "version": env!("CARGO_PKG_VERSION")}}});
+    let initialized = json!({"method": "initialized"});
     let request = json!({"id": 2, "method": "account/rateLimits/read"});
-    writeln!(stdin, "{initialize}").map_err(|_| "cannot initialize Codex app-server")?;
-    writeln!(stdin, "{request}").map_err(|_| "cannot request Codex rate limits")?;
-    stdin.flush().map_err(|_| "cannot flush Codex request")?;
-    drop(stdin);
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let bounded = BufReader::new(stdout).take(MAX_COLLECTOR_OUTPUT);
         for line in BufReader::new(bounded).lines().map_while(Result::ok) {
             if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                if value.get("id").and_then(Value::as_i64) == Some(2) {
-                    let _ = sender.send(value);
+                if sender.send(value).is_err() {
                     break;
                 }
             }
         }
     });
-    let response = match receiver.recv_timeout(Duration::from_secs(10)) {
-        Ok(response) => response,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("Codex rate-limit request timed out".into());
+
+    let receive_response = |expected_id: i64, timeout_message: &str| -> Result<Value, String> {
+        loop {
+            match receiver.recv_timeout(Duration::from_secs(10)) {
+                Ok(response) if response.get("id").and_then(Value::as_i64) == Some(expected_id) => {
+                    return Ok(response);
+                }
+                Ok(_) => {}
+                Err(_) => return Err(timeout_message.into()),
+            }
         }
     };
+
+    writeln!(stdin, "{initialize}").map_err(|_| "cannot initialize Codex app-server")?;
+    stdin
+        .flush()
+        .map_err(|_| "cannot flush Codex initialize request")?;
+    let initialize_response = match receive_response(1, "Codex initialization request timed out") {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    if let Some(error) = initialize_response.get("error") {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("Codex app-server rejected initialize: {error}"));
+    }
+
+    writeln!(stdin, "{initialized}").map_err(|_| "cannot initialize Codex app-server")?;
+    writeln!(stdin, "{request}").map_err(|_| "cannot request Codex rate limits")?;
+    stdin.flush().map_err(|_| "cannot flush Codex request")?;
+    let response = match receive_response(2, "Codex rate-limit request timed out") {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
     if let Some(error) = response.get("error") {
@@ -385,6 +517,118 @@ pub fn unavailable_provider(
 mod tests {
     use super::*;
 
+    static ENVIRONMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn finds_opencode_in_user_local_bin_without_shell_path() {
+        use std::{
+            env, fs,
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let _guard = ENVIRONMENT_LOCK.lock().unwrap();
+        let test_home = env::temp_dir().join(format!(
+            "vibebar-collector-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin_dir = test_home.join(".local/bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let executable = bin_dir.join("opencode");
+        fs::write(&executable, "#!/bin/sh\nprintf 'resolved\\n'\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let old_home = env::var_os("HOME");
+        let old_path = env::var_os("PATH");
+        unsafe {
+            env::set_var("HOME", &test_home);
+            env::set_var("PATH", "/usr/bin:/bin");
+        }
+        let result = fixed_command("opencode", &[]).output();
+        unsafe {
+            match old_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+            match old_path {
+                Some(value) => env::set_var("PATH", value),
+                None => env::remove_var("PATH"),
+            }
+        }
+        let _ = fs::remove_dir_all(&test_home);
+
+        let output = result.expect("opencode should resolve from the user-local fallback");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "resolved\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completes_codex_handshake_before_rate_limit_request() {
+        use std::{
+            env, fs,
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let _guard = ENVIRONMENT_LOCK.lock().unwrap();
+        let test_root = env::temp_dir().join(format!(
+            "vibebar-codex-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&test_root).unwrap();
+        let executable = test_root.join("codex");
+        fs::write(
+            &executable,
+            r##"#!/bin/sh
+initialized=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"test","codexHome":"/tmp","platformFamily":"unix","platformOs":"macos"}}' ;;
+    *'"method":"initialized"'*) initialized=1 ;;
+    *'"method":"account/rateLimits/read"'*)
+      if [ "$initialized" -eq 1 ]; then
+        printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":12,"resetsAt":100,"windowDurationMins":60},"secondary":{"usedPercent":34,"resetsAt":200,"windowDurationMins":10080},"rateLimitReachedType":null}}}'
+      else
+        printf '%s\n' '{"id":2,"error":{"code":-32000,"message":"not initialized"}}'
+      fi
+      ;;
+  esac
+done
+"##,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let old_path = env::var_os("PATH");
+        unsafe {
+            env::set_var("PATH", &test_root);
+        }
+        let result = collect_codex_rate_limits();
+        unsafe {
+            match old_path {
+                Some(value) => env::set_var("PATH", value),
+                None => env::remove_var("PATH"),
+            }
+        }
+        let _ = fs::remove_dir_all(&test_root);
+
+        let provider = result.expect("Codex rate limits should be available after initialization");
+        assert_eq!(provider.windows.len(), 2);
+        assert_eq!(provider.windows[0].used_percent, 12);
+    }
+
     #[test]
     fn parses_opencode_models_without_mixing_providers() {
         let input = "│ nan/qwen3.6 │\n│  Messages 22.180 │\n│  Input Tokens 493.4M │\n│  Output Tokens 10.2M │\n│ nan/deepseek-v4-flash │\n│  Messages 1914 │\n│  Input Tokens 61.5M │\n│  Output Tokens 1.3M │\n│ openai/gpt-5.6-sol │\n│  Messages 505 │\n│  Input Tokens 3.2M │";
@@ -413,5 +657,29 @@ mod tests {
         assert_eq!(provider.windows.len(), 2);
         assert_eq!(provider.windows[0].used_percent, 28);
         assert_eq!(provider.status, "ok");
+    }
+
+    #[test]
+    fn nan_quota_windows_use_billable_tokens_only() {
+        let windows = quota_windows_for("nan", "deepseek-v4-flash", 25_000_000);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].quota_tokens, 500_000_000);
+        assert_eq!(windows[0].used_percent, Some(5.0));
+        assert_eq!(windows[0].remaining_percent, Some(95.0));
+    }
+
+    #[test]
+    fn nan_models_without_published_quota_have_no_quota_windows() {
+        assert!(quota_windows_for("nan", "qwen3.6", 123).is_empty());
+    }
+
+    #[test]
+    fn glm5_has_monthly_window_and_unmetered_four_hour_window() {
+        let windows = quota_windows_for("nan", "glm5.2", 30_000_000);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].quota_tokens, 3_000_000_000);
+        assert!(windows[0].used_percent.is_some());
+        assert!(windows[1].used_percent.is_none());
+        assert_eq!(windows[1].duration_minutes, Some(240));
     }
 }
