@@ -221,7 +221,7 @@ pub struct DashboardSnapshot {
     pub diagnostics: Vec<String>,
 }
 
-const MAX_USAGE_HISTORY_ROWS: usize = 1_000;
+const USAGE_HISTORY_ROW_LIMIT: usize = 1_000;
 
 pub fn aggregate_workflow(events: &[UsageEvent]) -> WorkflowMetrics {
     let mut task_states: BTreeMap<&str, bool> = BTreeMap::new();
@@ -450,9 +450,9 @@ pub fn aggregate_history_rows(rows: impl IntoIterator<Item = UsageHistoryRow>) -
             .then_with(|| left.repository.cmp(&right.repository))
     });
 
-    let truncated = rows.len() > MAX_USAGE_HISTORY_ROWS;
+    let truncated = rows.len() > USAGE_HISTORY_ROW_LIMIT;
     if truncated {
-        rows.truncate(MAX_USAGE_HISTORY_ROWS);
+        rows.truncate(USAGE_HISTORY_ROW_LIMIT);
     }
 
     UsageHistory {
@@ -860,5 +860,31 @@ mod tests {
         assert_eq!(history.newest_day, None);
         assert!(!history.truncated);
         assert!(!history.repository_attribution_enabled);
+    }
+
+    #[test]
+    fn usage_history_truncates_at_documented_row_limit() {
+        let history = aggregate_history_rows((0..1_001).map(|index| {
+            history_row(
+                &format!("2026-08-{:02}", (index % 28) + 1),
+                &format!("github.com/example/repo-{index:04}"),
+                "executor",
+                "nan",
+                "qwen3.6",
+                10_000_u64.saturating_sub(index as u64),
+                0,
+                0,
+                1,
+                1,
+                None,
+            )
+        }));
+
+        assert!(history.truncated);
+        assert_eq!(history.rows.len(), USAGE_HISTORY_ROW_LIMIT);
+        assert_eq!(
+            history.rows.last().map(|row| row.repository.as_str()),
+            Some("github.com/example/repo-0999")
+        );
     }
 }

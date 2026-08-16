@@ -29,9 +29,9 @@ pub fn range_start(range: HistoryRange, today: NaiveDate) -> NaiveDate {
 
 #[cfg(test)]
 mod tests {
-    use chrono::NaiveDate;
+    use chrono::{Local, NaiveDate, TimeZone};
 
-    use super::{HistoryRange, range_start};
+    use super::{HistoryRange, local_day, range_start};
 
     #[test]
     fn computes_deterministic_history_window_starts() {
@@ -50,5 +50,15 @@ mod tests {
             range_start(HistoryRange::ThisMonth, today),
             NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()
         );
+    }
+
+    #[test]
+    fn local_day_uses_os_local_calendar_date_for_unambiguous_timestamp() {
+        let local_noon = Local
+            .with_ymd_and_hms(2026, 8, 16, 12, 0, 0)
+            .single()
+            .unwrap();
+
+        assert_eq!(local_day(local_noon.timestamp_millis()), "2026-08-16");
     }
 }

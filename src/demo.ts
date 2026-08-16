@@ -21,6 +21,7 @@ export const demoSnapshot: DashboardSnapshot = {
     { agent: "reviewer", provider: "chatgpt", model: "codex", source: "vibebar-events-30d", calls: 18, tasks: 17, tokens: { inputTokens: 8_900_000, outputTokens: 1_200_000, cacheReadTokens: 21_000_000, cacheWriteTokens: 0 } },
     { agent: "escalationExecutor", provider: "nan", model: "deepseek-v4-flash", source: "vibebar-events-30d", calls: 12, tasks: 8, tokens: { inputTokens: 4_700_000, outputTokens: 500_000, cacheReadTokens: 6_000_000, cacheWriteTokens: 0 } },
   ],
+  usageHistory: { rows: [], oldestDay: null, newestDay: null, truncated: false, repositoryAttributionEnabled: false },
   workflow: { tasks: 42, acceptedTasks: 36, attempts: 61, attemptsPerAccepted: 1.69, acceptanceRate: 0.857, reviewerRejections: 17, mechanicalFailures: 3, escalations: 8, costPerAcceptedMicrousd: 0 },
   recentEvents: [
     { occurredAt: new Date(now.getTime() - 120_000).toISOString(), provider: "chatgpt", model: "codex", role: "reviewer", taskId: "runtime-482", kind: "review_accepted" },
