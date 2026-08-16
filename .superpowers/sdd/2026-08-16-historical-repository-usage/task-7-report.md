@@ -173,3 +173,69 @@ Whitespace / diff hygiene:
 $ rtk git diff --check
 [no output]
 ```
+
+## Round 2 Fix
+
+Date: August 16, 2026
+Parent commit: `0805cc94b5389b0999e124240849ff9f12408e41`
+
+### Scope
+
+- Imported `demoSnapshot` into the focused fixture regression.
+- Added an explicit assertion that every public `demoSnapshot.usageHistory` row with `sourceFidelity === "event-fallback"` uses exactly `Repository attribution disabled`.
+- Left fixture and demo values unchanged because the public demo rows were already semantically correct; this round closes the coverage gap only.
+
+### RED Evidence
+
+Focused regression after adding the new assertion before wiring the demo import:
+
+```text
+$ rtk npm run test:frontend -- src/usageHistoryFixture.test.ts
+ FAIL  src/usageHistoryFixture.test.ts > usage-history fixture > keeps demo event-fallback rows on the repository-disabled sentinel
+ ReferenceError: demoSnapshot is not defined
+```
+
+This verified the review finding: the test suite did not yet cover the public demo snapshot path.
+
+### GREEN Evidence
+
+Focused regression after importing `demoSnapshot` and keeping the event-fallback assertion:
+
+```text
+$ rtk npm run test:frontend -- src/usageHistoryFixture.test.ts
+ ✓ src/usageHistoryFixture.test.ts (3 tests)
+ Test Files  1 passed (1)
+      Tests  3 passed (3)
+```
+
+Full frontend suite:
+
+```text
+$ rtk npm run test:frontend
+ ✓ src/history.test.ts (9 tests)
+ ✓ src/usageHistoryFixture.test.ts (3 tests)
+ Test Files  2 passed (2)
+      Tests  12 passed (12)
+```
+
+Production build:
+
+```text
+$ rtk npm run build
+ vite v7.3.6 building client environment for production...
+ ✓ built in 377ms
+```
+
+Rust suite:
+
+```text
+$ rtk cargo test --manifest-path src-tauri/Cargo.toml
+cargo test: 47 passed (4 suites, 0.27s)
+```
+
+Whitespace / diff hygiene:
+
+```text
+$ rtk git diff --check
+[no output]
+```

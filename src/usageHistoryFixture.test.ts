@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import usageHistoryFixture from "../examples/usage-history-v1.json";
+import { demoSnapshot } from "./demo";
 import readme from "../README.md?raw";
 import architecture from "../docs/architecture.md?raw";
 import threatModel from "../docs/threat-model.md?raw";
@@ -37,6 +38,13 @@ describe("usage-history fixture", () => {
     const serialized = JSON.stringify(fixture);
     expect(serialized).not.toMatch(bannedFixturePattern);
     expect(serialized).not.toMatch(/prompt|response|cookie|password|secret/i);
+  });
+
+  it("keeps demo event-fallback rows on the repository-disabled sentinel", () => {
+    const demoEventFallbackRows = demoSnapshot.usageHistory.rows.filter((row) => row.sourceFidelity === "event-fallback");
+
+    expect(demoEventFallbackRows.length).toBeGreaterThan(0);
+    expect(demoEventFallbackRows.every((row) => row.repository === "Repository attribution disabled")).toBe(true);
   });
 });
 
