@@ -4,8 +4,26 @@ export type ModelUsage = { model: string; calls: number; tokens: TokenUsage; quo
 export type QuotaWindow = { label: string; usedPercent: number; resetsAt: number | null; durationMinutes: number | null };
 export type ProviderSnapshot = { id: string; label: string; source: string; status: string; calls: number; tokens: TokenUsage; models: ModelUsage[]; windows: QuotaWindow[]; updatedAt: string; error: string | null };
 export type AgentUsage = { agent: string; provider: string; model: string; source: string; calls: number; tasks: number; tokens: TokenUsage };
-export type UsageHistoryRow = { day: string; repository: string; agent: string; provider: string; model: string; source: string; sourceFidelity: string; messageCount: number; sessionCount: number; tokens: TokenUsage; costMicrousd: number | null };
+export type HistoryRange = "today" | "7d" | "30d" | "month";
+export type HistorySourceFidelity = "metadata" | "session-fallback" | "event-fallback" | "unknown";
+export type UsageHistoryRow = { day: string; repository: string; agent: string; provider: string; model: string; source: string; sourceFidelity: HistorySourceFidelity; messageCount: number; sessionCount: number; tokens: TokenUsage; costMicrousd: number | null };
 export type UsageHistory = { rows: UsageHistoryRow[]; oldestDay: string | null; newestDay: string | null; truncated: boolean; repositoryAttributionEnabled: boolean };
+export type HistorySummary = {
+  billableTokens: number;
+  cacheTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  messageCount: number;
+  sessionCount: number;
+  costMicrousd: number | null;
+  sources: string[];
+  sourceFidelities: HistorySourceFidelity[];
+};
+export type ProviderHistorySummary = HistorySummary & { provider: string; model: string };
+export type RepositoryHistorySummary = HistorySummary & { repository: string; providers: string[]; models: string[] };
+export type AgentHistorySummary = HistorySummary & { agent: string; provider: string; model: string; repository: string };
 export type WorkflowMetrics = { tasks: number; acceptedTasks: number; attempts: number; attemptsPerAccepted: number | null; acceptanceRate: number | null; reviewerRejections: number; mechanicalFailures: number; escalations: number; costPerAcceptedMicrousd: number | null };
 export type RecentEvent = { occurredAt: string; provider: string; model: string; role: string; taskId: string; kind: string };
 export type DashboardSnapshot = { generatedAt: string; telemetryPath: string; providers: ProviderSnapshot[]; agentUsage: AgentUsage[]; usageHistory: UsageHistory; workflow: WorkflowMetrics; recentEvents: RecentEvent[]; diagnostics: string[] };
