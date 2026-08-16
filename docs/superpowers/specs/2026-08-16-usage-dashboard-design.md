@@ -81,7 +81,7 @@ The initial NaN quota map follows the published model documentation:
 
 - `deepseek-v4-flash`: 500M tokens per member/month.
 - `mimo-v2.5`: 1B tokens per member/month.
-- `glm5.2`: 3B tokens per member/billing period, plus a documented 400M rolling four-hour window.
+- `glm5.2`: 3B tokens per member/billing period, plus a documented 400M rolling four-hour window. The current OpenCode 30-day aggregate cannot calculate a truthful four-hour percentage, so that secondary limit is shown as documented but locally unmetered until a time-bucketed source exists.
 - `qwen3.6` and `gemma4`: no published monthly token allowance; show usage without a percentage.
 
 If a future documentation change invalidates a quota, the map is updated in one collector module and the UI remains provider-neutral.
@@ -103,7 +103,7 @@ OpenCode model statistics remain the authoritative provider/model total. They ar
 Extend the provider-neutral snapshot with:
 
 - A token-semantic helper or equivalent serialized fields for billable/cache totals.
-- Per-model quota windows where a model has more than one documented limit.
+- Per-model quota windows where a model has more than one documented limit; each window can explicitly mark its percentage as unavailable when the local source does not provide the required time bucket.
 - `agentUsage`, containing role/agent label, provider, model, calls, distinct tasks, and token counters.
 
 Keep old telemetry rows readable. Any new serialized event field must be optional and backward-compatible, or use a versioned schema if the event contract needs a required semantic change. Existing validation, line limits, idempotency, and credential-scrubbed subprocess environments remain in force.
