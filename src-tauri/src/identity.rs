@@ -1,8 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
+    time::Duration,
 };
+
+const REPOSITORY_RESOLVE_TIMEOUT: Duration = Duration::from_millis(100);
+static TIMED_OUT_REPOSITORIES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 pub fn normalize_provider_id(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
@@ -92,7 +96,30 @@ impl RepositoryResolver {
             return cached;
         }
 
-        let resolved = resolve_repository_identifier(project_dir);
+        let timed_out = TIMED_OUT_REPOSITORIES.get_or_init(|| Mutex::new(HashSet::new()));
+        if timed_out
+            .lock()
+            .expect("timed-out repository cache poisoned")
+            .contains(&key)
+        {
+            return None;
+        }
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let path = key.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(resolve_repository_identifier(&path));
+        });
+        let resolved = match receiver.recv_timeout(REPOSITORY_RESOLVE_TIMEOUT) {
+            Ok(value) => value,
+            Err(_) => {
+                timed_out
+                    .lock()
+                    .expect("timed-out repository cache poisoned")
+                    .insert(key.clone());
+                None
+            }
+        };
         self.cache
             .lock()
             .expect("repository resolver cache poisoned")
@@ -322,7 +349,7 @@ mod tests {
     };
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn normalizes_and_labels_known_and_unknown_providers() {
@@ -504,5 +531,26 @@ mod tests {
 
         let resolver = RepositoryResolver::new(true);
         assert_eq!(resolver.resolve(&repo_dir), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_does_not_block_on_unresponsive_git_metadata() {
+        let repo_dir = unique_dir("repository-resolver-blocked-config");
+        let git_dir = repo_dir.join(".git");
+        fs::create_dir_all(&git_dir).expect("create git dir");
+        let status = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(git_dir.join("config"))
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success());
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let resolver = RepositoryResolver::new(true);
+            let _ = sender.send(resolver.resolve(&repo_dir));
+        });
+
+        assert_eq!(receiver.recv_timeout(Duration::from_millis(250)), Ok(None));
     }
 }

@@ -42,6 +42,7 @@ const historyBarTones = ["mint", "violet", "amber", "slate"] as const;
 
 const formatTokens = (value: number) => `${compact.format(value)} tok`;
 const billableTokens = (tokens: { inputTokens: number; outputTokens: number }) => tokens.inputTokens + tokens.outputTokens;
+const reasoningTokens = (tokens: { reasoningTokens?: number }) => tokens.reasoningTokens ?? 0;
 const cacheTokens = (tokens: { cacheReadTokens: number; cacheWriteTokens: number }) => tokens.cacheReadTokens + tokens.cacheWriteTokens;
 const quotaPercent = (value: number | null) => value == null ? "—" : `${value.toFixed(value < 10 ? 1 : 0)}%`;
 
@@ -106,13 +107,14 @@ function summarizeHistoryRows(rows: UsageHistoryRow[]) {
   return rows.reduce((summary, row) => {
     summary.billableTokens += billableTokens(row.tokens);
     summary.cacheTokens += cacheTokens(row.tokens);
+    summary.reasoningTokens += reasoningTokens(row.tokens);
     summary.messages += row.messageCount;
     summary.sessions += row.sessionCount;
     if (row.costMicrousd != null) {
       summary.costMicrousd = (summary.costMicrousd ?? 0) + row.costMicrousd;
     }
     return summary;
-  }, { billableTokens: 0, cacheTokens: 0, messages: 0, sessions: 0, costMicrousd: null as number | null });
+  }, { billableTokens: 0, reasoningTokens: 0, cacheTokens: 0, messages: 0, sessions: 0, costMicrousd: null as number | null });
 }
 
 function buildDailyProviderSeries(
@@ -169,15 +171,17 @@ function QuotaMeter({ quota }: { quota: ModelQuota }) {
 
 function ModelRow({ model }: { model: ModelUsage }) {
   const billable = billableTokens(model.tokens);
+  const reasoning = reasoningTokens(model.tokens);
   const cache = cacheTokens(model.tokens);
   return <div className="model-row">
-    <div className="model-main"><span className="model-dot" /><div><strong>{model.model}</strong><small>{compact.format(model.calls)} calls · {formatTokens(billable)} billable</small><small className="token-secondary">{formatTokens(cache)} cache</small></div></div>
+    <div className="model-main"><span className="model-dot" /><div><strong>{model.model}</strong><small>{compact.format(model.calls)} calls · {formatTokens(billable)} input + output</small>{reasoning > 0 ? <small>{formatTokens(reasoning)} reasoning</small> : null}<small className="token-secondary">{formatTokens(cache)} cache</small></div></div>
     {model.quotaWindows.length === 0 ? <span className="limit-pill">No known quota</span> : <div className="quota-stack">{model.quotaWindows.map((quota) => <QuotaMeter key={`${model.model}-${quota.label}`} quota={quota} />)}</div>}
   </div>;
 }
 
 function ProviderCard({ provider }: { provider: ProviderSnapshot }) {
   const total = billableTokens(provider.tokens);
+  const reasoning = reasoningTokens(provider.tokens);
   const cache = cacheTokens(provider.tokens);
   return <article className={`provider-card ${provider.status === "error" ? "provider-error" : ""}`}>
     <header>
@@ -187,7 +191,7 @@ function ProviderCard({ provider }: { provider: ProviderSnapshot }) {
     </header>
     {provider.error ? <p className="provider-error-copy">{provider.error}</p> : null}
     {provider.windows.length > 0 ? <div className="window-grid">{provider.windows.map((window) => <WindowMeter key={window.label} window={window} />)}</div> : null}
-    {provider.models.length > 0 ? <><div className="provider-total"><div><span>30-day billable traffic</span><strong>{formatTokens(total)}</strong></div><div><span>Cache read/write</span><strong className="token-secondary">{formatTokens(cache)}</strong></div><div><span>Calls</span><strong>{compact.format(provider.calls)}</strong></div></div><div className="model-list">{provider.models.slice(0, 5).map((model) => <ModelRow key={model.model} model={model} />)}</div></> : null}
+    {provider.models.length > 0 ? <><div className="provider-total"><div><span>30-day input + output</span><strong>{formatTokens(total)}</strong></div><div><span>Reasoning</span><strong>{formatTokens(reasoning)}</strong></div><div><span>Cache read/write</span><strong className="token-secondary">{formatTokens(cache)}</strong></div><div><span>Calls</span><strong>{compact.format(provider.calls)}</strong></div></div><div className="model-list">{provider.models.slice(0, 5).map((model) => <ModelRow key={model.model} model={model} />)}</div></> : null}
   </article>;
 }
 
@@ -200,12 +204,13 @@ function AgentUsagePanel({ usage }: { usage: typeof demoSnapshot.agentUsage }) {
 
 function CompactProviderCard({ provider }: { provider: ProviderSnapshot }) {
   const billable = billableTokens(provider.tokens);
+  const reasoning = reasoningTokens(provider.tokens);
   const cache = cacheTokens(provider.tokens);
   return <article className={`compact-provider ${provider.status === "error" ? "provider-error" : ""}`}>
     <header><div className={`provider-mark ${provider.id === "nan" ? "nan" : "chatgpt"}`}>{provider.id === "nan" ? "N" : "✦"}</div><div className="provider-heading"><h3>{provider.label}</h3><span>{provider.source}</span></div><span className={`status-badge ${provider.status}`}><i />{provider.status}</span></header>
     {provider.error ? <p className="provider-error-copy">{provider.error}</p> : null}
     {provider.windows.length > 0 ? <div className="compact-window-grid">{provider.windows.map((window) => <WindowMeter key={window.label} window={window} />)}</div> : null}
-    {provider.models.length > 0 ? <><div className="compact-provider-total"><strong>{formatTokens(billable)}</strong><span>{formatTokens(cache)} cache · {compact.format(provider.calls)} calls</span></div><div className="compact-model-list">{provider.models.slice(0, 3).map((model) => { const quota = model.quotaWindows.find((item) => item.usedPercent != null) ?? model.quotaWindows[0]; return <div className="compact-model" key={model.model}><div><strong>{model.model}</strong><small>{compact.format(model.calls)} calls · {formatTokens(billableTokens(model.tokens))}</small></div><span>{quota ? quota.usedPercent == null ? "—" : `${quotaPercent(quota.remainingPercent)} left` : "No quota"}</span></div>; })}</div></> : <p className="compact-empty">{provider.id === "chatgpt-codex" ? "Subscription windows only; token totals are not exposed by Codex." : "No model traffic available."}</p>}
+    {provider.models.length > 0 ? <><div className="compact-provider-total"><strong>{formatTokens(billable)}</strong><span>{formatTokens(reasoning)} reasoning · {formatTokens(cache)} cache · {compact.format(provider.calls)} calls</span></div><div className="compact-model-list">{provider.models.slice(0, 3).map((model) => { const quota = model.quotaWindows.find((item) => item.usedPercent != null) ?? model.quotaWindows[0]; return <div className="compact-model" key={model.model}><div><strong>{model.model}</strong><small>{compact.format(model.calls)} calls · {formatTokens(billableTokens(model.tokens))}</small></div><span>{quota ? quota.usedPercent == null ? "—" : `${quotaPercent(quota.remainingPercent)} left` : "No quota"}</span></div>; })}</div></> : <p className="compact-empty">{provider.id === "chatgpt-codex" ? "Subscription windows only; token totals are not exposed by Codex." : "No model traffic available."}</p>}
   </article>;
 }
 
@@ -272,16 +277,17 @@ function ProviderHistoryTable({ summaries, providerLabels }: { summaries: Provid
     <div className="history-table-head"><div><p className="eyebrow">BY PROVIDER / MODEL</p><h3>Billable versus cache</h3></div><span>{summaries.length} row{summaries.length === 1 ? "" : "s"}</span></div>
     <table className="history-table">
       <caption className="sr-only">Historical usage grouped by provider and model</caption>
-      <thead><tr><th>Provider / model</th><th>Source fidelity</th><th>Billable</th><th>Cache</th><th>Msgs</th><th>Sessions</th><th>Observed cost</th></tr></thead>
+      <thead><tr><th>Provider / model</th><th>Source fidelity</th><th>Input + output</th><th>Reasoning</th><th>Cache</th><th>Msgs</th><th>Sessions</th><th>Observed cost</th></tr></thead>
       <tbody>
         {summaries.map((summary) => <tr key={`${summary.provider}-${summary.model}`}>
           <td><strong>{providerLabel(summary.provider, providerLabels)}</strong><small>{summary.model}</small></td>
           <td><SourceBadges sourceFidelities={summary.sourceFidelities} sources={summary.sources} /></td>
           <td>{formatTokens(summary.billableTokens)}</td>
+          <td>{formatTokens(summary.reasoningTokens)}</td>
           <td>{formatTokens(summary.cacheTokens)}</td>
           <td>{compact.format(summary.messageCount)}</td>
           <td>{compact.format(summary.sessionCount)}</td>
-          <td>{formatObservedCost(summary.costMicrousd) ?? "—"}</td>
+          <td>{formatObservedCost(summary.costMicrousd) ?? "Unavailable"}</td>
         </tr>)}
       </tbody>
     </table>
@@ -293,13 +299,14 @@ function RepositoryHistoryTable({ summaries }: { summaries: RepositoryHistorySum
     <div className="history-table-head"><div><p className="eyebrow">BY REPOSITORY</p><h3>Normalized local attribution</h3></div><span>{summaries.length} repo{summaries.length === 1 ? "" : "s"}</span></div>
     <table className="history-table">
       <caption className="sr-only">Historical usage grouped by repository</caption>
-      <thead><tr><th>Repository</th><th>Providers</th><th>Source fidelity</th><th>Billable</th><th>Cache</th><th>Msgs</th><th>Sessions</th></tr></thead>
+      <thead><tr><th>Repository</th><th>Providers</th><th>Source fidelity</th><th>Input + output</th><th>Reasoning</th><th>Cache</th><th>Msgs</th><th>Sessions</th></tr></thead>
       <tbody>
         {summaries.map((summary) => <tr key={summary.repository}>
           <td><strong>{repositoryLabel(summary.repository)}</strong><small>{summary.models.join(" · ")}</small></td>
           <td>{summary.providers.join(" · ")}</td>
           <td><SourceBadges sourceFidelities={summary.sourceFidelities} sources={summary.sources} /></td>
           <td>{formatTokens(summary.billableTokens)}</td>
+          <td>{formatTokens(summary.reasoningTokens)}</td>
           <td>{formatTokens(summary.cacheTokens)}</td>
           <td>{compact.format(summary.messageCount)}</td>
           <td>{compact.format(summary.sessionCount)}</td>
@@ -314,7 +321,7 @@ function AgentHistoryTable({ summaries, providerLabels }: { summaries: AgentHist
     <div className="history-table-head"><div><p className="eyebrow">BY AGENT</p><h3>Context for the spend</h3></div><span>{summaries.length} row{summaries.length === 1 ? "" : "s"}</span></div>
     <table className="history-table">
       <caption className="sr-only">Historical usage grouped by agent, provider, model, and repository</caption>
-      <thead><tr><th>Agent</th><th>Provider / model</th><th>Repository</th><th>Source fidelity</th><th>Billable</th><th>Cache</th><th>Sessions</th><th>Observed cost</th></tr></thead>
+      <thead><tr><th>Agent</th><th>Provider / model</th><th>Repository</th><th>Source fidelity</th><th>Input + output</th><th>Reasoning</th><th>Cache</th><th>Sessions</th><th>Observed cost</th></tr></thead>
       <tbody>
         {summaries.map((summary) => <tr key={`${summary.agent}-${summary.provider}-${summary.model}-${summary.repository}`}>
           <td><strong>{summary.agent}</strong></td>
@@ -322,9 +329,10 @@ function AgentHistoryTable({ summaries, providerLabels }: { summaries: AgentHist
           <td>{repositoryLabel(summary.repository)}</td>
           <td><SourceBadges sourceFidelities={summary.sourceFidelities} sources={summary.sources} /></td>
           <td>{formatTokens(summary.billableTokens)}</td>
+          <td>{formatTokens(summary.reasoningTokens)}</td>
           <td>{formatTokens(summary.cacheTokens)}</td>
           <td>{compact.format(summary.sessionCount)}</td>
-          <td>{formatObservedCost(summary.costMicrousd) ?? "—"}</td>
+          <td>{formatObservedCost(summary.costMicrousd) ?? "Unavailable"}</td>
         </tr>)}
       </tbody>
     </table>
@@ -359,11 +367,12 @@ function HistoryPanel({ snapshot, providerLabels, range, onRangeChange }: { snap
       {hasSessionFallback ? <div className="history-note">Session fallback is lower fidelity: whole sessions can land on their last update day instead of exact assistant-message timestamps.</div> : null}
       {!history.repositoryAttributionEnabled ? <div className="history-note">Repository attribution is disabled for this snapshot, so repository rows stay grouped under the explicit disabled label.</div> : null}
       <div className="history-summary-grid">
-        <div className="history-summary-card"><span>Billable</span><strong>{formatTokens(totals.billableTokens)}</strong><small>Input + output only</small></div>
+        <div className="history-summary-card"><span>Input + output</span><strong>{formatTokens(totals.billableTokens)}</strong><small>Base usage, excluding reasoning</small></div>
+        <div className="history-summary-card"><span>Reasoning</span><strong>{formatTokens(totals.reasoningTokens)}</strong><small>Reported separately by message metadata</small></div>
         <div className="history-summary-card"><span>Cache</span><strong>{formatTokens(totals.cacheTokens)}</strong><small>Read + write kept separate</small></div>
         <div className="history-summary-card"><span>Messages</span><strong>{compact.format(totals.messages)}</strong><small>Assistant-message count when available</small></div>
         <div className="history-summary-card"><span>Sessions</span><strong>{compact.format(totals.sessions)}</strong><small>Distinct sessions or fallback session rows</small></div>
-        {totals.costMicrousd != null ? <div className="history-summary-card"><span>Observed cost</span><strong>{formatObservedCost(totals.costMicrousd)}</strong><small>Only when the source provides cost</small></div> : null}
+        <div className="history-summary-card"><span>Observed cost</span><strong>{formatObservedCost(totals.costMicrousd) ?? "Unavailable"}</strong><small>{totals.costMicrousd == null ? "Provider did not expose pricing" : "Reported by the source"}</small></div>
       </div>
       <article className="history-chart-card">
         <HistoryChart rows={rows} providerLabels={providerLabels} providerTotals={providerTotals} providerTones={providerTones} />

@@ -8,7 +8,7 @@ pub mod storage;
 pub const APP_IDENTIFIER: &str = "com.huntsman.vibebar";
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -123,7 +123,7 @@ fn merge_history_sources(
     merged
 }
 
-fn synthesize_history_only_provider_cards(
+fn reconcile_provider_cards_with_history(
     mut providers: Vec<ProviderSnapshot>,
     history: &UsageHistory,
     now: DateTime<Utc>,
@@ -131,15 +131,19 @@ fn synthesize_history_only_provider_cards(
     let existing_ids = providers
         .iter()
         .map(|provider| normalize_provider_id(&provider.id))
-        .collect::<std::collections::HashSet<_>>();
+        .collect::<BTreeSet<_>>();
     let mut grouped: BTreeMap<String, BTreeMap<String, (u64, TokenUsage)>> = BTreeMap::new();
+    let mut sources: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
-    for row in history
-        .rows
-        .iter()
-        .filter(|row| !existing_ids.contains(&normalize_provider_id(&row.provider)))
-    {
+    for row in &history.rows {
         let provider_id = normalize_provider_id(&row.provider);
+        if existing_ids.contains(&provider_id) && row.source_fidelity == "event-fallback" {
+            continue;
+        }
+        sources
+            .entry(provider_id.clone())
+            .or_default()
+            .insert(row.source.clone());
         let entry = grouped
             .entry(provider_id)
             .or_default()
@@ -150,6 +154,7 @@ fn synthesize_history_only_provider_cards(
                     TokenUsage {
                         input_tokens: 0,
                         output_tokens: 0,
+                        reasoning_tokens: 0,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
                     },
@@ -161,6 +166,10 @@ fn synthesize_history_only_provider_cards(
             .1
             .output_tokens
             .saturating_add(row.tokens.output_tokens);
+        entry.1.reasoning_tokens = entry
+            .1
+            .reasoning_tokens
+            .saturating_add(row.tokens.reasoning_tokens);
         entry.1.cache_read_tokens = entry
             .1
             .cache_read_tokens
@@ -172,6 +181,62 @@ fn synthesize_history_only_provider_cards(
     }
 
     let updated_at = now.to_rfc3339();
+    for provider in &mut providers {
+        let provider_id = normalize_provider_id(&provider.id);
+        let Some(history_models) = grouped.remove(&provider_id) else {
+            continue;
+        };
+        let existing_models = provider
+            .models
+            .iter()
+            .map(|model| (model.model.clone(), model.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut models = history_models
+            .into_iter()
+            .map(|(model, (calls, tokens))| {
+                let existing = existing_models.get(&model);
+                let recalculated_quotas =
+                    collectors::quota_windows_for(&provider_id, &model, tokens.billable());
+                ModelUsage {
+                    model,
+                    calls,
+                    tokens,
+                    quota_tokens: existing.and_then(|item| item.quota_tokens),
+                    quota_label: existing.and_then(|item| item.quota_label.clone()),
+                    quota_windows: if recalculated_quotas.is_empty() {
+                        existing
+                            .map(|item| item.quota_windows.clone())
+                            .unwrap_or_default()
+                    } else {
+                        recalculated_quotas
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        models.sort_by(|left, right| {
+            right
+                .tokens
+                .billable()
+                .cmp(&left.tokens.billable())
+                .then_with(|| right.calls.cmp(&left.calls))
+                .then_with(|| left.model.cmp(&right.model))
+        });
+        provider.calls = models.iter().map(|model| model.calls).sum();
+        provider.tokens = sum_model_tokens(&models);
+        provider.models = models;
+        provider.source = sources
+            .get(&provider_id)
+            .and_then(|items| {
+                (items.len() == 1)
+                    .then(|| items.iter().next().cloned())
+                    .flatten()
+            })
+            .unwrap_or_else(|| "usage-history-31d".into());
+        provider.status = "ok".into();
+        provider.error = None;
+        provider.updated_at = updated_at.clone();
+    }
+
     for (provider_id, models) in grouped {
         let mut models = models
             .into_iter()
@@ -193,27 +258,7 @@ fn synthesize_history_only_provider_cards(
                 .then_with(|| left.model.cmp(&right.model))
         });
         let calls = models.iter().map(|model| model.calls).sum();
-        let tokens = models.iter().fold(
-            TokenUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-            },
-            |mut total, model| {
-                total.input_tokens = total.input_tokens.saturating_add(model.tokens.input_tokens);
-                total.output_tokens = total
-                    .output_tokens
-                    .saturating_add(model.tokens.output_tokens);
-                total.cache_read_tokens = total
-                    .cache_read_tokens
-                    .saturating_add(model.tokens.cache_read_tokens);
-                total.cache_write_tokens = total
-                    .cache_write_tokens
-                    .saturating_add(model.tokens.cache_write_tokens);
-                total
-            },
-        );
+        let tokens = sum_model_tokens(&models);
         providers.push(ProviderSnapshot {
             id: provider_id.clone(),
             label: provider_label(&provider_id),
@@ -229,6 +274,34 @@ fn synthesize_history_only_provider_cards(
     }
 
     providers
+}
+
+fn sum_model_tokens(models: &[ModelUsage]) -> TokenUsage {
+    models.iter().fold(
+        TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        },
+        |mut total, model| {
+            total.input_tokens = total.input_tokens.saturating_add(model.tokens.input_tokens);
+            total.output_tokens = total
+                .output_tokens
+                .saturating_add(model.tokens.output_tokens);
+            total.reasoning_tokens = total
+                .reasoning_tokens
+                .saturating_add(model.tokens.reasoning_tokens);
+            total.cache_read_tokens = total
+                .cache_read_tokens
+                .saturating_add(model.tokens.cache_read_tokens);
+            total.cache_write_tokens = total
+                .cache_write_tokens
+                .saturating_add(model.tokens.cache_write_tokens);
+            total
+        },
+    )
 }
 
 struct SnapshotBuildInputs {
@@ -268,7 +341,7 @@ fn build_snapshot_from_sources(inputs: SnapshotBuildInputs) -> DashboardSnapshot
             (event_history, None)
         }
     };
-    let providers = synthesize_history_only_provider_cards(providers, &usage_history, now);
+    let providers = reconcile_provider_cards_with_history(providers, &usage_history, now);
     let recent_events = events
         .iter()
         .rev()
@@ -491,6 +564,7 @@ mod tests {
             tokens: TokenUsage {
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             },
@@ -523,6 +597,7 @@ mod tests {
             tokens: TokenUsage {
                 input_tokens: spec.input_tokens,
                 output_tokens: spec.output_tokens,
+                reasoning_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             },
@@ -555,6 +630,7 @@ mod tests {
             tokens: Some(TokenUsage {
                 input_tokens: spec.input_tokens,
                 output_tokens: spec.output_tokens,
+                reasoning_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             }),
@@ -573,6 +649,7 @@ mod tests {
             tokens: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                reasoning_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             },
@@ -901,6 +978,13 @@ mod tests {
                 .iter()
                 .any(|provider| provider.id == "chatgpt-codex")
         );
+        let chatgpt = snapshot
+            .providers
+            .iter()
+            .find(|provider| provider.id == "chatgpt-codex")
+            .unwrap();
+        assert_eq!(chatgpt.source, "codex-app-server");
+        assert!(chatgpt.models.is_empty());
         assert!(
             snapshot
                 .providers
@@ -939,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_synthesizes_history_only_provider_cards_without_overriding_existing_cards() {
+    fn snapshot_synthesizes_missing_cards_and_reconciles_existing_cards() {
         let now = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
         let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
         let providers = vec![ProviderSnapshot {
@@ -951,6 +1035,7 @@ mod tests {
             tokens: TokenUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                reasoning_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             },
@@ -1040,9 +1125,102 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "nan")
             .expect("existing provider card should remain");
-        assert_eq!(nan.source, "opencode-stats-30d");
-        assert_eq!(nan.status, "error");
-        assert_eq!(nan.error.as_deref(), Some("OpenCode stats unavailable"));
+        assert_eq!(nan.source, "opencode-db-messages-31d");
+        assert_eq!(nan.status, "ok");
+        assert_eq!(nan.tokens.billable(), 990);
+        assert_eq!(nan.error, None);
+    }
+
+    #[test]
+    fn snapshot_reconciles_existing_provider_totals_with_message_history() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
+        let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
+        let providers = vec![ProviderSnapshot {
+            id: "nan".into(),
+            label: "NaN".into(),
+            source: "opencode-stats-30d".into(),
+            status: "ok".into(),
+            calls: 100,
+            tokens: TokenUsage {
+                input_tokens: 60_000_000,
+                output_tokens: 7_000_000,
+                reasoning_tokens: 0,
+                cache_read_tokens: 123_000_000,
+                cache_write_tokens: 0,
+            },
+            models: vec![crate::domain::ModelUsage {
+                model: "deepseek-v4-flash".into(),
+                calls: 100,
+                tokens: TokenUsage {
+                    input_tokens: 60_000_000,
+                    output_tokens: 7_000_000,
+                    reasoning_tokens: 0,
+                    cache_read_tokens: 123_000_000,
+                    cache_write_tokens: 0,
+                },
+                quota_tokens: Some(500_000_000),
+                quota_label: Some("500M tokens monthly".into()),
+                quota_windows: vec![crate::domain::ModelQuota {
+                    label: "Monthly model allowance".into(),
+                    quota_tokens: 500_000_000,
+                    used_percent: Some(99.0),
+                    remaining_percent: Some(1.0),
+                    resets_at: None,
+                    duration_minutes: None,
+                    period_label: "Published monthly token limit".into(),
+                }],
+            }],
+            windows: Vec::new(),
+            updated_at: "2026-08-16T10:00:00Z".into(),
+            error: None,
+        }];
+        let primary_history = UsageHistory {
+            available: true,
+            rows: vec![{
+                let mut row = history_row(HistoryRowSpec {
+                    day: "2026-08-16",
+                    repository: "github.com/example/esdata",
+                    agent: "esdata-executor",
+                    provider: "nan",
+                    model: "deepseek-v4-flash",
+                    source: "opencode-db-messages-31d",
+                    source_fidelity: "metadata",
+                    input_tokens: 120,
+                    output_tokens: 30,
+                });
+                row.message_count = 1;
+                row
+            }],
+            oldest_day: Some("2026-08-16".into()),
+            newest_day: Some("2026-08-16".into()),
+            truncated: false,
+            repository_attribution_enabled: true,
+        };
+
+        let snapshot = build_snapshot_from_sources(SnapshotBuildInputs {
+            now,
+            telemetry_path: "/tmp/events-v1.jsonl".into(),
+            providers,
+            events: Vec::new(),
+            diagnostics: Vec::new(),
+            opencode_usage: Ok(crate::opencode_history::OpenCodeUsageBundle {
+                history: primary_history,
+                agent_usage: Vec::new(),
+                diagnostics: Vec::new(),
+            }),
+            history_since: since,
+        });
+
+        let nan = snapshot
+            .providers
+            .iter()
+            .find(|provider| provider.id == "nan")
+            .unwrap();
+        assert_eq!(nan.calls, 1);
+        assert_eq!(nan.tokens.billable(), 150);
+        assert_eq!(nan.source, "opencode-db-messages-31d");
+        let used_percent = nan.models[0].quota_windows[0].used_percent.unwrap();
+        assert!((used_percent - 0.00003).abs() < f64::EPSILON);
     }
 
     #[test]

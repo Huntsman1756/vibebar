@@ -12,6 +12,7 @@ import type {
 type AggregateBucket = {
   inputTokens: number;
   outputTokens: number;
+  reasoningTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
   messageCount: number;
@@ -74,6 +75,7 @@ function createBucket(): AggregateBucket {
   return {
     inputTokens: 0,
     outputTokens: 0,
+    reasoningTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
     messageCount: 0,
@@ -90,6 +92,7 @@ function createBucket(): AggregateBucket {
 function addRow(bucket: AggregateBucket, row: UsageHistoryRow): void {
   bucket.inputTokens += row.tokens.inputTokens;
   bucket.outputTokens += row.tokens.outputTokens;
+  bucket.reasoningTokens += row.tokens.reasoningTokens ?? 0;
   bucket.cacheReadTokens += row.tokens.cacheReadTokens;
   bucket.cacheWriteTokens += row.tokens.cacheWriteTokens;
   bucket.messageCount += row.messageCount;
@@ -111,6 +114,7 @@ function summarizeBucket(bucket: AggregateBucket) {
     cacheTokens: bucket.cacheReadTokens + bucket.cacheWriteTokens,
     inputTokens: bucket.inputTokens,
     outputTokens: bucket.outputTokens,
+    reasoningTokens: bucket.reasoningTokens,
     cacheReadTokens: bucket.cacheReadTokens,
     cacheWriteTokens: bucket.cacheWriteTokens,
     messageCount: bucket.messageCount,

@@ -57,6 +57,7 @@ struct MessageMetadataRecord {
     provider: String,
     input_tokens: i64,
     output_tokens: i64,
+    reasoning_tokens: i64,
     cache_read_tokens: i64,
     cache_write_tokens: i64,
     cost_dollars: Option<f64>,
@@ -90,6 +91,7 @@ impl Default for HistoryAccumulator {
             tokens: TokenUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                reasoning_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             },
@@ -112,6 +114,7 @@ impl Default for AgentUsageAccumulator {
             tokens: TokenUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                reasoning_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             },
@@ -293,28 +296,30 @@ fn query_message_usage(
     deadline: Instant,
 ) -> Result<OpenCodeUsageBundle, String> {
     ensure_query_within_budget(deadline)?;
-    let mut statement = connection
-        .prepare(
-            "SELECT
+    let (project_join, project_directory) = project_worktree_sql(connection);
+    let query = format!(
+        "SELECT
                 m.time_created,
                 COALESCE(json_extract(m.data, '$.agent'), s.agent, 'Sin identificar'),
                 COALESCE(json_extract(m.data, '$.modelID'), json_extract(s.model, '$.id'), ''),
                 COALESCE(json_extract(m.data, '$.providerID'), json_extract(s.model, '$.providerID'), 'opencode'),
                 COALESCE(json_extract(m.data, '$.tokens.input'), 0),
                 COALESCE(json_extract(m.data, '$.tokens.output'), 0),
+                COALESCE(json_extract(m.data, '$.tokens.reasoning'), 0),
                 COALESCE(json_extract(m.data, '$.tokens.cache.read'), 0),
                 COALESCE(json_extract(m.data, '$.tokens.cache.write'), 0),
                 json_extract(m.data, '$.cost'),
                 m.session_id,
-                s.directory
+                {project_directory}
              FROM message m
              JOIN session s ON s.id = m.session_id
+             {project_join}
              WHERE m.time_created >= ?1
-               AND json_extract(m.data, '$.role') = 'assistant'",
-        )
-        .map_err(|error| {
-            sqlite_query_error("OpenCode assistant metadata query failed", error)
-        })?;
+               AND json_extract(m.data, '$.role') = 'assistant'"
+    );
+    let mut statement = connection
+        .prepare(&query)
+        .map_err(|error| sqlite_query_error("OpenCode assistant metadata query failed", error))?;
     let mut rows = statement
         .query([since_millis])
         .map_err(|error| sqlite_query_error("OpenCode assistant metadata query failed", error))?;
@@ -346,20 +351,23 @@ fn query_message_usage(
             output_tokens: row
                 .get(5)
                 .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
-            cache_read_tokens: row
+            reasoning_tokens: row
                 .get(6)
                 .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
-            cache_write_tokens: row
+            cache_read_tokens: row
                 .get(7)
                 .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
-            cost_dollars: row
+            cache_write_tokens: row
                 .get(8)
                 .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
-            session_id: row
+            cost_dollars: row
                 .get(9)
                 .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
-            directory: row
+            session_id: row
                 .get(10)
+                .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
+            directory: row
+                .get(11)
                 .map_err(|error| format!("OpenCode assistant metadata row was invalid: {error}"))?,
         };
         let Some(day) = local_day(record.time_created) else {
@@ -383,6 +391,7 @@ fn query_message_usage(
             &mut history_entry.tokens,
             record.input_tokens,
             record.output_tokens,
+            record.reasoning_tokens,
             record.cache_read_tokens,
             record.cache_write_tokens,
         );
@@ -403,6 +412,7 @@ fn query_message_usage(
             &mut agent_entry.tokens,
             record.input_tokens,
             record.output_tokens,
+            record.reasoning_tokens,
             record.cache_read_tokens,
             record.cache_write_tokens,
         );
@@ -428,21 +438,24 @@ fn query_session_usage(
     deadline: Instant,
 ) -> Result<OpenCodeUsageBundle, String> {
     ensure_query_within_budget(deadline)?;
+    let (project_join, project_directory) = project_worktree_sql(connection);
+    let query = format!(
+        "SELECT
+                s.time_updated,
+                s.id,
+                {project_directory},
+                COALESCE(s.agent, 'Sin identificar'),
+                COALESCE(s.model, ''),
+                COALESCE(s.tokens_input, 0),
+                COALESCE(s.tokens_output, 0),
+                COALESCE(s.tokens_cache_read, 0),
+                COALESCE(s.tokens_cache_write, 0)
+             FROM session s
+             {project_join}
+             WHERE s.time_updated >= ?1"
+    );
     let mut statement = connection
-        .prepare(
-            "SELECT
-                time_updated,
-                id,
-                COALESCE(directory, ''),
-                COALESCE(agent, 'Sin identificar'),
-                COALESCE(model, ''),
-                COALESCE(tokens_input, 0),
-                COALESCE(tokens_output, 0),
-                COALESCE(tokens_cache_read, 0),
-                COALESCE(tokens_cache_write, 0)
-             FROM session
-             WHERE time_updated >= ?1",
-        )
+        .prepare(&query)
         .map_err(|error| sqlite_query_error("OpenCode session fallback query failed", error))?;
     let mut rows = statement
         .query([since_millis])
@@ -505,6 +518,7 @@ fn query_session_usage(
             &mut history_entry.tokens,
             record.input_tokens,
             record.output_tokens,
+            0,
             record.cache_read_tokens,
             record.cache_write_tokens,
         );
@@ -521,6 +535,7 @@ fn query_session_usage(
             &mut agent_entry.tokens,
             record.input_tokens,
             record.output_tokens,
+            0,
             record.cache_read_tokens,
             record.cache_write_tokens,
         );
@@ -534,6 +549,49 @@ fn query_session_usage(
             .into_iter()
             .collect(),
     })
+}
+
+fn project_worktree_sql(connection: &Connection) -> (&'static str, &'static str) {
+    let support = connection
+        .query_row(
+            "SELECT
+                EXISTS(SELECT 1 FROM pragma_table_info('session') WHERE name = 'project_id'),
+                EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project'),
+                EXISTS(SELECT 1 FROM pragma_table_info('project') WHERE name = 'sandboxes')",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, bool>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .unwrap_or((false, false, false));
+
+    if support.0 && support.1 && support.2 {
+        (
+            "LEFT JOIN project p ON p.id = s.project_id",
+            "COALESCE(
+                (SELECT value
+                 FROM json_each(COALESCE(p.sandboxes, '[]'))
+                 WHERE type = 'text'
+                   AND ((value NOT LIKE '/private/%' AND value NOT LIKE '%_worktrees/%')
+                        OR p.worktree LIKE '/private/%')
+                 ORDER BY length(value)
+                 LIMIT 1),
+                p.worktree,
+                s.directory,
+                '')",
+        )
+    } else if support.0 && support.1 {
+        (
+            "LEFT JOIN project p ON p.id = s.project_id",
+            "COALESCE(p.worktree, s.directory, '')",
+        )
+    } else {
+        ("", "COALESCE(s.directory, '')")
+    }
 }
 
 fn query_message_agent_usage(
@@ -608,6 +666,7 @@ fn add_tokens(
     total: &mut TokenUsage,
     input_tokens: i64,
     output_tokens: i64,
+    reasoning_tokens: i64,
     cache_read_tokens: i64,
     cache_write_tokens: i64,
 ) {
@@ -617,6 +676,9 @@ fn add_tokens(
     total.output_tokens = total
         .output_tokens
         .saturating_add(non_negative(output_tokens));
+    total.reasoning_tokens = total
+        .reasoning_tokens
+        .saturating_add(non_negative(reasoning_tokens));
     total.cache_read_tokens = total
         .cache_read_tokens
         .saturating_add(non_negative(cache_read_tokens));
@@ -674,7 +736,7 @@ fn invalid_timestamp_diagnostic(source: &str, count: u64) -> Option<String> {
 }
 
 fn dollars_to_microusd(value: f64) -> Option<u64> {
-    if value.is_finite() && value >= 0.0 {
+    if value.is_finite() && value > 0.0 {
         Some((value * 1_000_000.0).round().clamp(0.0, u64::MAX as f64) as u64)
     } else {
         None
@@ -1406,7 +1468,7 @@ mod tests {
                         "agent": "executor",
                         "modelID": "qwen3.6",
                         "providerID": " NaN ",
-                        "tokens": { "input": 10, "output": 2 },
+                        "tokens": { "input": 10, "output": 2, "reasoning": 7 },
                         "cost": 0.123456
                     })
                     .to_string(),
@@ -1427,6 +1489,98 @@ mod tests {
         assert_eq!(bundle.agent_usage.len(), 1);
         assert_eq!(bundle.agent_usage[0].provider, "nan");
         assert_eq!(bundle.agent_usage[0].tokens.billable(), 12);
+        assert_eq!(
+            serde_json::to_value(&bundle.history.rows[0].tokens).unwrap()["reasoningTokens"],
+            7
+        );
+        assert_eq!(
+            serde_json::to_value(&bundle.agent_usage[0].tokens).unwrap()["reasoningTokens"],
+            7
+        );
+    }
+
+    #[test]
+    fn message_query_prefers_project_worktree_over_temporary_session_directory() {
+        let repo_root = TestDir::new("project-worktree");
+        let repo = create_repo(
+            repo_root.path(),
+            "eduayudas",
+            "https://github.com/example/eduayudas.git",
+        );
+        let sandbox = repo_root.path().join("temporary-sandbox");
+        fs::create_dir_all(&sandbox).unwrap();
+        let connection = Connection::open_in_memory().unwrap();
+        create_history_schema(&connection);
+        connection
+            .execute_batch(
+                "CREATE TABLE project (
+                    id TEXT PRIMARY KEY,
+                    worktree TEXT NOT NULL,
+                    sandboxes TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO project VALUES (?1, ?2, ?3)",
+                (
+                    "p1",
+                    sandbox.display().to_string(),
+                    serde_json::to_string(&[repo.display().to_string()]).unwrap(),
+                ),
+            )
+            .unwrap();
+        let timestamp = local_timestamp(2026, 8, 16, 12);
+        insert_session(
+            &connection,
+            "s1",
+            &sandbox,
+            "executor",
+            r#"{"id":"qwen3.6","providerID":"nan"}"#,
+            timestamp,
+        );
+        connection
+            .execute_batch("ALTER TABLE session ADD COLUMN project_id TEXT;")
+            .unwrap();
+        connection
+            .execute("UPDATE session SET project_id='p1' WHERE id='s1'", [])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                (
+                    "m1",
+                    "s1",
+                    timestamp,
+                    json!({
+                        "role": "assistant",
+                        "agent": "executor",
+                        "modelID": "qwen3.6",
+                        "providerID": "nan",
+                        "tokens": { "input": 10, "output": 2 }
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+
+        let mut resolver = RepositoryResolver::new(true);
+        let bundle = collect_usage_from_connection(
+            &connection,
+            local_timestamp(2026, 8, 15, 0),
+            &mut resolver,
+        )
+        .unwrap();
+
+        assert_eq!(
+            bundle.history.rows[0].repository,
+            "github.com/example/eduayudas"
+        );
+    }
+
+    #[test]
+    fn zero_cost_is_treated_as_unavailable() {
+        assert_eq!(super::dollars_to_microusd(0.0), None);
     }
 
     #[test]
@@ -1576,6 +1730,7 @@ mod tests {
             tokens: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 2,
+                reasoning_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             },
@@ -1603,6 +1758,7 @@ mod tests {
                 tokens: TokenUsage {
                     input_tokens: 135,
                     output_tokens: 35,
+                    reasoning_tokens: 0,
                     cache_read_tokens: 12,
                     cache_write_tokens: 6,
                 },
@@ -1617,6 +1773,7 @@ mod tests {
                 tokens: TokenUsage {
                     input_tokens: 25,
                     output_tokens: 5,
+                    reasoning_tokens: 0,
                     cache_read_tokens: 0,
                     cache_write_tokens: 9,
                 },
@@ -1633,6 +1790,7 @@ mod tests {
                 tokens: TokenUsage {
                     input_tokens: 900,
                     output_tokens: 90,
+                    reasoning_tokens: 0,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                 },
@@ -1647,6 +1805,7 @@ mod tests {
                 tokens: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 4,
+                    reasoning_tokens: 0,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                 },
@@ -1661,6 +1820,7 @@ mod tests {
                 tokens: TokenUsage {
                     input_tokens: 40,
                     output_tokens: 4,
+                    reasoning_tokens: 0,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                 },
@@ -1675,6 +1835,7 @@ mod tests {
                 tokens: TokenUsage {
                     input_tokens: 70,
                     output_tokens: 7,
+                    reasoning_tokens: 0,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                 },

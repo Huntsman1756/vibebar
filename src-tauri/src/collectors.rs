@@ -143,7 +143,8 @@ fn bounded_output(program: &str, args: &[&str], timeout: Duration) -> Result<Str
 }
 
 fn parse_human_number(value: &str) -> Option<u64> {
-    let value = value.trim().trim_start_matches('$');
+    let normalized = value.trim().trim_start_matches('$').replace(',', "");
+    let value = normalized.as_str();
     let (number, multiplier) = match value.chars().last()? {
         'K' => (&value[..value.len() - 1], 1_000f64),
         'M' => (&value[..value.len() - 1], 1_000_000f64),
@@ -167,7 +168,7 @@ fn parse_human_number(value: &str) -> Option<u64> {
 pub fn parse_opencode_stats(output: &str) -> Result<Vec<ProviderSnapshot>, String> {
     let ansi = Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").map_err(|_| "invalid ANSI parser")?;
     let field = Regex::new(
-        r"^(Messages|Input Tokens|Output Tokens|Cache Read|Cache Write)\s+([0-9.]+[KMB]?)$",
+        r"^(Messages|Input Tokens|Output Tokens|Cache Read|Cache Write)\s+([0-9.,]+[KMB]?)$",
     )
     .map_err(|_| "invalid stats parser")?;
     let cleaned = ansi.replace_all(output, "");
@@ -186,6 +187,7 @@ pub fn parse_opencode_stats(output: &str) -> Result<Vec<ProviderSnapshot>, Strin
                         tokens: TokenUsage {
                             input_tokens: 0,
                             output_tokens: 0,
+                            reasoning_tokens: 0,
                             cache_read_tokens: 0,
                             cache_write_tokens: 0,
                         },
@@ -326,12 +328,14 @@ fn sum_tokens<'a>(tokens: impl Iterator<Item = &'a TokenUsage>) -> TokenUsage {
         TokenUsage {
             input_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         },
         |mut total, item| {
             total.input_tokens = total.input_tokens.saturating_add(item.input_tokens);
             total.output_tokens = total.output_tokens.saturating_add(item.output_tokens);
+            total.reasoning_tokens = total.reasoning_tokens.saturating_add(item.reasoning_tokens);
             total.cache_read_tokens = total
                 .cache_read_tokens
                 .saturating_add(item.cache_read_tokens);
@@ -430,6 +434,7 @@ pub fn parse_codex_rate_limits(response: &Value) -> Result<ProviderSnapshot, Str
         tokens: TokenUsage {
             input_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         },
@@ -532,6 +537,7 @@ pub fn unavailable_provider(
         tokens: TokenUsage {
             input_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         },
@@ -677,6 +683,16 @@ done
             Some(500_000_000)
         );
         assert!(providers.iter().any(|provider| provider.id == "openai"));
+    }
+
+    #[test]
+    fn parses_opencode_message_counts_with_comma_thousands_separator() {
+        let input = "│ nan/qwen3.6 │\n│  Messages 4,253 │\n│  Input Tokens 59.8M │\n│  Output Tokens 4.7M │";
+
+        let providers = parse_opencode_stats(input).unwrap();
+
+        assert_eq!(providers[0].calls, 4_253);
+        assert_eq!(providers[0].models[0].calls, 4_253);
     }
 
     #[test]

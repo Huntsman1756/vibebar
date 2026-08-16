@@ -13,6 +13,8 @@ pub struct TokenUsage {
     #[serde(default)]
     pub output_tokens: u64,
     #[serde(default)]
+    pub reasoning_tokens: u64,
+    #[serde(default)]
     pub cache_read_tokens: u64,
     #[serde(default)]
     pub cache_write_tokens: u64,
@@ -28,8 +30,14 @@ impl TokenUsage {
             .saturating_add(self.cache_write_tokens)
     }
 
+    pub fn reasoning(&self) -> u64 {
+        self.reasoning_tokens
+    }
+
     pub fn total(&self) -> u64 {
-        self.billable().saturating_add(self.cache())
+        self.billable()
+            .saturating_add(self.reasoning())
+            .saturating_add(self.cache())
     }
 }
 
@@ -296,6 +304,7 @@ pub fn aggregate_agent_usage(events: &[UsageEvent], since: DateTime<Utc>) -> Vec
                     tokens: TokenUsage {
                         input_tokens: 0,
                         output_tokens: 0,
+                        reasoning_tokens: 0,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
                     },
@@ -318,6 +327,11 @@ pub fn aggregate_agent_usage(events: &[UsageEvent], since: DateTime<Utc>) -> Vec
                 .tokens
                 .output_tokens
                 .saturating_add(tokens.output_tokens);
+            entry.0.tokens.reasoning_tokens = entry
+                .0
+                .tokens
+                .reasoning_tokens
+                .saturating_add(tokens.reasoning_tokens);
             entry.0.tokens.cache_read_tokens = entry
                 .0
                 .tokens
@@ -409,6 +423,7 @@ pub fn aggregate_history_rows(rows: impl IntoIterator<Item = UsageHistoryRow>) -
             tokens: TokenUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                reasoning_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             },
@@ -424,6 +439,10 @@ pub fn aggregate_history_rows(rows: impl IntoIterator<Item = UsageHistoryRow>) -
             .tokens
             .output_tokens
             .saturating_add(row.tokens.output_tokens);
+        entry.tokens.reasoning_tokens = entry
+            .tokens
+            .reasoning_tokens
+            .saturating_add(row.tokens.reasoning_tokens);
         entry.tokens.cache_read_tokens = entry
             .tokens
             .cache_read_tokens
@@ -528,6 +547,7 @@ mod tests {
             tokens: TokenUsage {
                 input_tokens: spec.input_tokens,
                 output_tokens: spec.output_tokens,
+                reasoning_tokens: 0,
                 cache_read_tokens: spec.cache_read_tokens,
                 cache_write_tokens: 0,
             },
@@ -574,6 +594,7 @@ mod tests {
             tokens: Some(TokenUsage {
                 input_tokens,
                 output_tokens,
+                reasoning_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             }),
@@ -587,6 +608,7 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 12,
             output_tokens: 8,
+            reasoning_tokens: 0,
             cache_read_tokens: 900,
             cache_write_tokens: 50,
         };
@@ -673,6 +695,7 @@ mod tests {
             tokens: TokenUsage {
                 input_tokens: 100,
                 output_tokens: 10,
+                reasoning_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             },
@@ -688,6 +711,7 @@ mod tests {
                 tokens: TokenUsage {
                     input_tokens: 900,
                     output_tokens: 90,
+                    reasoning_tokens: 0,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                 },
@@ -702,6 +726,7 @@ mod tests {
                 tokens: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 4,
+                    reasoning_tokens: 0,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                 },

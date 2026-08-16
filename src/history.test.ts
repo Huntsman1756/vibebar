@@ -166,6 +166,16 @@ describe("selectHistoryRows", () => {
 });
 
 describe("aggregateHistoryByProvider", () => {
+  it("keeps reasoning tokens separate from billable input and output", () => {
+    const row = structuredClone(rows[0]);
+    (row.tokens as unknown as { reasoningTokens: number }).reasoningTokens = 7;
+
+    const [summary] = aggregateHistoryByProvider([row]);
+
+    expect(summary.billableTokens).toBe(150);
+    expect((summary as unknown as { reasoningTokens: number }).reasoningTokens).toBe(7);
+  });
+
   it("aggregates provider/model totals while keeping cache, costs, and fidelity distinct", () => {
     const summaries = aggregateHistoryByProvider(selectHistoryRows(rows, "30d", "2026-08-16"));
     const nanQwen = summaries.find((summary) => summary.provider === "nan" && summary.model === "qwen3.6");

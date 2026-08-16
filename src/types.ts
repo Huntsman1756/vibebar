@@ -1,4 +1,4 @@
-export type TokenUsage = { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number };
+export type TokenUsage = { inputTokens: number; outputTokens: number; reasoningTokens?: number; cacheReadTokens: number; cacheWriteTokens: number };
 export type ModelQuota = { label: string; quotaTokens: number; usedPercent: number | null; remainingPercent: number | null; resetsAt: number | null; durationMinutes: number | null; periodLabel: string };
 export type ModelUsage = { model: string; calls: number; tokens: TokenUsage; quotaTokens: number | null; quotaLabel: string | null; quotaWindows: ModelQuota[] };
 export type QuotaWindow = { label: string; usedPercent: number; resetsAt: number | null; durationMinutes: number | null };
@@ -13,6 +13,7 @@ export type HistorySummary = {
   cacheTokens: number;
   inputTokens: number;
   outputTokens: number;
+  reasoningTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
   messageCount: number;
