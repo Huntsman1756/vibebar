@@ -70,6 +70,33 @@ function AgentUsagePanel({ usage }: { usage: AgentUsage[] }) {
   </section>;
 }
 
+function CompactProviderCard({ provider }: { provider: ProviderSnapshot }) {
+  const billable = billableTokens(provider.tokens);
+  const cache = cacheTokens(provider.tokens);
+  return <article className={`compact-provider ${provider.status === "error" ? "provider-error" : ""}`}>
+    <header><div className={`provider-mark ${provider.id === "nan" ? "nan" : "chatgpt"}`}>{provider.id === "nan" ? "N" : "✦"}</div><div className="provider-heading"><h3>{provider.label}</h3><span>{provider.source}</span></div><span className={`status-badge ${provider.status}`}><i />{provider.status}</span></header>
+    {provider.error ? <p className="provider-error-copy">{provider.error}</p> : null}
+    {provider.windows.length > 0 ? <div className="compact-window-grid">{provider.windows.map((window) => <WindowMeter key={window.label} window={window} />)}</div> : null}
+    {provider.models.length > 0 ? <><div className="compact-provider-total"><strong>{formatTokens(billable)}</strong><span>{formatTokens(cache)} cache · {compact.format(provider.calls)} calls</span></div><div className="compact-model-list">{provider.models.slice(0, 3).map((model) => { const quota = model.quotaWindows.find((item) => item.usedPercent != null) ?? model.quotaWindows[0]; return <div className="compact-model" key={model.model}><div><strong>{model.model}</strong><small>{compact.format(model.calls)} calls · {formatTokens(billableTokens(model.tokens))}</small></div><span>{quota ? quota.usedPercent == null ? "—" : `${quotaPercent(quota.remainingPercent)} left` : "No quota"}</span></div>; })}</div></> : <p className="compact-empty">{provider.id === "chatgpt-codex" ? "Subscription windows only; token totals are not exposed by Codex." : "No model traffic available."}</p>}
+  </article>;
+}
+
+function PopoverDashboard({ snapshot, providers, loading, preview, error, refresh }: { snapshot: DashboardSnapshot | null; providers: ProviderSnapshot[]; loading: boolean; preview: boolean; error: string | null; refresh: () => Promise<void> }) {
+  const openFull = () => { void invoke("open_full_dashboard"); };
+  return <main className="app-shell popover-shell">
+    <header className="popover-header"><div className="brand"><span className="brand-mark"><i /><i /><i /></span><strong>VibeBar</strong><em>local</em></div><div className="popover-actions"><span className="privacy"><i />On-device</span><button className="icon-refresh" onClick={() => void refresh()} disabled={loading} aria-label="Refresh"><span className={loading ? "spin" : ""}>↻</span></button></div></header>
+    <div className="popover-content">
+      <div className="popover-title"><div><p className="eyebrow">USAGE AT A GLANCE</p><h1>Capacity</h1></div><span>{snapshot ? new Date(snapshot.generatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "Reading…"}</span></div>
+      {preview ? <div className="popover-notice">Browser preview · sample data</div> : null}
+      <div className="compact-provider-list">{providers.map((provider) => <CompactProviderCard key={provider.id} provider={provider} />)}{!snapshot ? <div className="compact-provider skeleton" /> : null}</div>
+      <section className="compact-agents"><div className="compact-section-head"><span>TOP AGENTS / ROLES</span><small>30 days</small></div>{(snapshot?.agentUsage.length ?? 0) === 0 ? <p className="compact-empty">No role token data yet.</p> : <div className="compact-agent-list">{snapshot?.agentUsage.slice(0, 3).map((item) => <div className="compact-agent" key={`${item.agent}-${item.provider}-${item.model}`}><span className="agent-mark">{item.agent.slice(0, 1).toUpperCase()}</span><div><strong>{item.agent}</strong><small>{item.provider} / {item.model}</small></div><span className="compact-agent-tokens">{formatTokens(billableTokens(item.tokens))}</span></div>)}</div>}</section>
+      {(snapshot?.diagnostics.length ?? 0) > 0 ? <details className="compact-diagnostics"><summary>{snapshot?.diagnostics.length} source issue(s)</summary>{snapshot?.diagnostics.map((item) => <p key={item}>{item}</p>)}</details> : null}
+      {error ? <p className="compact-error">{error}</p> : null}
+      <button className="open-dashboard" onClick={openFull}>Open full dashboard <span>↗</span></button>
+    </div>
+  </main>;
+}
+
 function Metric({ label, value, detail, tone }: { label: string; value: string; detail: string; tone?: string }) {
   return <div className="metric"><span>{label}</span><strong className={tone}>{value}</strong><small>{detail}</small></div>;
 }
@@ -107,6 +134,11 @@ function App() {
     const rank = (id: string) => order.indexOf(id) < 0 ? 99 : order.indexOf(id);
     return rank(a.id) - rank(b.id);
   }), [snapshot]);
+  const isPopover = new URLSearchParams(window.location.search).get("view") === "popover";
+
+  if (isPopover) {
+    return <PopoverDashboard snapshot={snapshot} providers={providers} loading={loading} preview={preview} error={error} refresh={refresh} />;
+  }
 
   return <main className="app-shell">
     <nav className="topbar">
