@@ -17,15 +17,21 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    pub fn total(&self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.output_tokens)
-            .saturating_add(self.cache_read_tokens)
+    pub fn billable(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    pub fn cache(&self) -> u64 {
+        self.cache_read_tokens
             .saturating_add(self.cache_write_tokens)
+    }
+
+    pub fn total(&self) -> u64 {
+        self.billable().saturating_add(self.cache())
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelUsage {
     pub model: String,
@@ -33,6 +39,20 @@ pub struct ModelUsage {
     pub tokens: TokenUsage,
     pub quota_tokens: Option<u64>,
     pub quota_label: Option<String>,
+    #[serde(default)]
+    pub quota_windows: Vec<ModelQuota>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelQuota {
+    pub label: String,
+    pub quota_tokens: u64,
+    pub used_percent: Option<f64>,
+    pub remaining_percent: Option<f64>,
+    pub resets_at: Option<i64>,
+    pub duration_minutes: Option<i64>,
+    pub period_label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,7 +64,7 @@ pub struct QuotaWindow {
     pub duration_minutes: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSnapshot {
     pub id: String,
@@ -136,12 +156,24 @@ pub struct RecentEvent {
     pub kind: EventKind,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUsage {
+    pub agent: String,
+    pub provider: String,
+    pub model: String,
+    pub calls: u64,
+    pub tasks: u64,
+    pub tokens: TokenUsage,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardSnapshot {
     pub generated_at: String,
     pub telemetry_path: String,
     pub providers: Vec<ProviderSnapshot>,
+    pub agent_usage: Vec<AgentUsage>,
     pub workflow: WorkflowMetrics,
     pub recent_events: Vec<RecentEvent>,
     pub diagnostics: Vec<String>,
@@ -189,6 +221,81 @@ pub fn aggregate_workflow(events: &[UsageEvent]) -> WorkflowMetrics {
     }
 }
 
+pub fn aggregate_agent_usage(events: &[UsageEvent], since: DateTime<Utc>) -> Vec<AgentUsage> {
+    let mut groups: BTreeMap<(String, String, String), (AgentUsage, HashSet<String>)> =
+        BTreeMap::new();
+    for event in events.iter().filter(|event| event.occurred_at >= since) {
+        let key = (
+            event.role.clone(),
+            event.provider.clone(),
+            event.model.clone(),
+        );
+        let entry = groups.entry(key).or_insert_with(|| {
+            (
+                AgentUsage {
+                    agent: event.role.clone(),
+                    provider: event.provider.clone(),
+                    model: event.model.clone(),
+                    calls: 0,
+                    tasks: 0,
+                    tokens: TokenUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                    },
+                },
+                HashSet::new(),
+            )
+        });
+        entry.1.insert(event.task_id.clone());
+        if matches!(event.kind, EventKind::AttemptStarted) {
+            entry.0.calls = entry.0.calls.saturating_add(1);
+        }
+        if let Some(tokens) = &event.tokens {
+            entry.0.tokens.input_tokens = entry
+                .0
+                .tokens
+                .input_tokens
+                .saturating_add(tokens.input_tokens);
+            entry.0.tokens.output_tokens = entry
+                .0
+                .tokens
+                .output_tokens
+                .saturating_add(tokens.output_tokens);
+            entry.0.tokens.cache_read_tokens = entry
+                .0
+                .tokens
+                .cache_read_tokens
+                .saturating_add(tokens.cache_read_tokens);
+            entry.0.tokens.cache_write_tokens = entry
+                .0
+                .tokens
+                .cache_write_tokens
+                .saturating_add(tokens.cache_write_tokens);
+        }
+    }
+
+    let mut usage = groups
+        .into_values()
+        .map(|(mut usage, tasks)| {
+            usage.tasks = tasks.len() as u64;
+            usage
+        })
+        .collect::<Vec<_>>();
+    usage.sort_by(|left, right| {
+        right
+            .tokens
+            .billable()
+            .cmp(&left.tokens.billable())
+            .then_with(|| right.calls.cmp(&left.calls))
+            .then_with(|| left.agent.cmp(&right.agent))
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.model.cmp(&right.model))
+    });
+    usage
+}
+
 pub fn validate_batch(events: &[UsageEvent]) -> Result<(), String> {
     if events.is_empty() || events.len() > 1_000 {
         return Err("event batch must contain 1..1000 items".into());
@@ -222,6 +329,115 @@ mod tests {
             duration_ms: None,
             cost_microusd: Some(10),
         }
+    }
+
+    fn token_event(
+        id: &str,
+        task: &str,
+        role: &str,
+        kind: EventKind,
+        occurred_at: DateTime<Utc>,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> UsageEvent {
+        UsageEvent {
+            schema_version: 1,
+            event_id: id.into(),
+            occurred_at,
+            provider: "nan".into(),
+            model: "qwen3.6".into(),
+            role: role.into(),
+            task_id: task.into(),
+            kind,
+            attempt: Some(1),
+            tokens: Some(TokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            }),
+            duration_ms: None,
+            cost_microusd: None,
+        }
+    }
+
+    #[test]
+    fn billable_tokens_exclude_cache_tokens() {
+        let usage = TokenUsage {
+            input_tokens: 12,
+            output_tokens: 8,
+            cache_read_tokens: 900,
+            cache_write_tokens: 50,
+        };
+
+        assert_eq!(usage.billable(), 20);
+        assert_eq!(usage.cache(), 950);
+        assert_eq!(usage.total(), 970);
+    }
+
+    #[test]
+    fn agent_usage_groups_role_provider_model_and_counts_distinct_tasks() {
+        let since = Utc::now() - chrono::Duration::days(30);
+        let events = vec![
+            token_event(
+                "start-a",
+                "task-a",
+                "executor",
+                EventKind::AttemptStarted,
+                since + chrono::Duration::hours(1),
+                10,
+                2,
+            ),
+            token_event(
+                "done-a",
+                "task-a",
+                "executor",
+                EventKind::AttemptCompleted,
+                since + chrono::Duration::hours(1),
+                5,
+                1,
+            ),
+            token_event(
+                "start-b",
+                "task-b",
+                "executor",
+                EventKind::AttemptStarted,
+                since + chrono::Duration::hours(2),
+                20,
+                3,
+            ),
+            token_event(
+                "start-review",
+                "task-a",
+                "reviewer",
+                EventKind::AttemptStarted,
+                since + chrono::Duration::hours(2),
+                7,
+                4,
+            ),
+        ];
+
+        let usage = aggregate_agent_usage(&events, since);
+        let executor = usage.iter().find(|item| item.agent == "executor").unwrap();
+        assert_eq!(executor.calls, 2);
+        assert_eq!(executor.tasks, 2);
+        assert_eq!(executor.tokens.billable(), 41);
+    }
+
+    #[test]
+    fn agent_usage_excludes_events_older_than_since() {
+        let since = Utc::now() - chrono::Duration::days(30);
+        let events = vec![token_event(
+            "old",
+            "old-task",
+            "executor",
+            EventKind::AttemptStarted,
+            since - chrono::Duration::minutes(1),
+            999,
+            999,
+        )];
+
+        assert!(aggregate_agent_usage(&events, since).is_empty());
     }
 
     #[test]
