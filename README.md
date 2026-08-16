@@ -1,34 +1,27 @@
 # VibeBar
 
-VibeBar is a local-first system-tray monitor for AI coding agents on Windows, macOS, and Linux. It puts provider capacity and orchestration quality in the same view: limits, tokens, attempts, reviewer rejections, mechanical failures, escalations, and accepted outcomes.
+VibeBar is a local-first system-tray monitor for AI coding agents on Windows, macOS, and Linux. It shows provider capacity, token usage, historical history, and orchestration quality in one local dashboard without sending private data to a backend.
 
-The current V1 reads:
+## What it reads
 
 - ChatGPT/Codex subscription windows from the installed Codex App Server method `account/rateLimits/read`.
-- 30-day model traffic from the installed OpenCode CLI (`opencode stats --pure`), including NaN and any future provider visible to OpenCode.
-- 30-day agent/model usage from the local OpenCode session database when available; only aggregate session columns are read.
-- Outcome telemetry from VibeBar's bounded append-only JSONL contract.
+- 30-day model traffic from the installed OpenCode CLI via `opencode stats --pure --days 30 --models`.
+- OpenCode assistant-message metadata when the local SQLite schema supports it, with a session-table fallback for older or unavailable schemas.
+- VibeBar's bounded append-only JSONL telemetry for orchestration outcomes and fallback usage history.
 
-VibeBar does not read or copy `auth.json`, browser cookies, API keys, prompts, responses, source code, or terminal history. Collector subprocesses receive a credential-scrubbed environment and use fixed arguments with hard time and output limits.
+VibeBar does not read or copy `auth.json`, browser cookies, API keys, prompts, responses, source code, terminal history, or generated bundles. Collector subprocesses receive a credential-scrubbed environment and use fixed arguments with hard time and output limits.
 
-## Stack
-
-- Tauri 2 and Rust for the tray, collectors, validation, and local storage.
-- React 19, TypeScript, and Vite for the dashboard.
-- No backend, remote relay, analytics service, or database.
-
-## Development
+## Installation
 
 Prerequisites are the normal [Tauri 2 platform dependencies](https://v2.tauri.app/start/prerequisites/), Node.js, npm, and Rust.
 
 ```sh
-npm install
+npm ci
 npm run build
-npm run test:rust
 npm run tauri dev
 ```
 
-`npm run dev` runs a browser preview with explicitly labelled sample data. Live collectors only run in the Tauri application.
+`npm run dev` starts a browser preview with labeled sample data. Live collectors only run in the Tauri application.
 
 For a local ingestion smoke test after building the Rust binaries:
 
@@ -38,34 +31,69 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin vibebar-ingest < examples/e
 
 The command prints the number of newly appended events. Replaying the same file prints `0`.
 
-## Data sources and semantics
+## Development
 
-| Source | What VibeBar reports | Important limitation |
-| --- | --- | --- |
-| Codex App Server | Used percentage and reset time for available subscription windows | Does not expose token totals for subscription work |
-| OpenCode stats | Calls and input/output/cache tokens by provider and model over 30 days | A rolling 30-day total is not necessarily the provider billing period |
-| OpenCode session database | Agent/model session counts and input/output/cache totals over 30 days | Only the local `session` aggregate columns are read; transcript tables are never queried |
-| VibeBar events | Attempts, acceptance, rejections, failures, escalations, duration, and optional cost | Requires the orchestrator to append the V1 events |
+Before sending changes, run:
 
-### Tray popover and usage semantics
+```sh
+npm ci
+npm run build
+npm run test:frontend
+rtk cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+rtk cargo test --manifest-path src-tauri/Cargo.toml
+rtk cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+```
 
-Clicking the macOS tray icon opens a compact popover with ChatGPT/Codex capacity, NaN model usage, and the top agent/role spend. The “Open full dashboard” button opens the detailed window; the tray click no longer opens that large window directly.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution checklist, fixture rules, and privacy guardrails.
 
-Quota percentages use only `input + output` tokens. `cache read` and `cache write` are displayed separately and never inflate a quota percentage. Agent attribution comes from the event `role` grouped with its provider and model over the last 30 days; provider/model totals from OpenCode are not silently counted again as agent spend.
+## Historical period selector
 
-NaN quota references include `deepseek-v4-flash` at 500M tokens/member/month, `mimo-v2.5` at 1B tokens/member/month, and `glm5.2` at 3B tokens/member/billing period, as published in the [NaN model documentation](https://nan.builders/docs/models). NaN also publishes a 400M rolling four-hour limit for `glm5.2`, but the current OpenCode source is a 30-day aggregate and cannot calculate a truthful four-hour percentage; VibeBar marks that window as locally unmetered. The docs publish no monthly token allowance for `qwen3.6` or `gemma4`, so VibeBar shows “No known quota” instead of assuming unlimited use.
+The historical dashboard uses the operating system's local calendar and a single bounded daily series to derive:
 
-See [docs/telemetry-v1.md](docs/telemetry-v1.md) for the event contract and [docs/threat-model.md](docs/threat-model.md) for trust boundaries.
+- `Today`
+- `7 days`
+- `30 days`
+- `This month`
 
-## Provider architecture
+The backend keeps only the most recent 31 local calendar days. The frontend slices that shared series so the chart and tables stay consistent across periods.
 
-Collectors return one provider-neutral `ProviderSnapshot` containing model usage, quota windows, source identity, freshness, and diagnostics. New providers should add one bounded collector; they should not add provider-specific branches to the React UI.
+## Metric semantics
 
-The planned collector order is:
+Billable tokens are exactly `input + output`. Cache tokens are `cache read + cache write`, shown separately and never added into quota percentages.
 
-1. Stable local/official API or CLI contract.
-2. Local logs with incremental parsing.
-3. Explicit user-configured API source.
-4. Browser session scraping only as a separately reviewed, opt-in module.
+For a model with a documented quota:
 
-Cached or unavailable data must remain visibly stale/error; collectors may not silently substitute another account or provider.
+```text
+usedPercent = billableTokens / quotaTokens * 100
+remainingPercent = max(0, 100 - usedPercent)
+```
+
+Quota percentages may exceed 100 in detailed views so exhausted limits stay visible. Compact progress bars are capped visually.
+
+## Provider and repository semantics
+
+Provider IDs stay distinct. `nan` renders as `NaN`, `opencode-go` renders as `OpenCode Go`, and unknown provider IDs remain visible rather than being collapsed into a different provider.
+
+Repository attribution is local-only. For both public and private local repositories, VibeBar reads local Git metadata, normalizes the remote into a repository identifier such as `github.com/owner/repository`, and never serializes the absolute path. If no remote is available, the UI falls back to a local directory-based identifier. VibeBar never calls GitHub, checks repository visibility, or sends repository identifiers over the network.
+
+Source fidelity stays explicit:
+
+- assistant-message metadata is the preferred source when available,
+- the session-table adapter is the lower-fidelity fallback,
+- VibeBar telemetry is the final fallback when OpenCode attribution is unavailable.
+
+## Privacy limits
+
+The app remains local-first by design. Missing data stays visibly unavailable or stale instead of becoming zero. VibeBar does not infer billing periods, does not invent token totals, and does not substitute another account or provider.
+
+## Reference docs
+
+- [docs/architecture.md](docs/architecture.md)
+- [docs/telemetry-v1.md](docs/telemetry-v1.md)
+- [docs/threat-model.md](docs/threat-model.md)
+
+## License and security
+
+VibeBar is licensed under the [MIT License](LICENSE).
+
+Security issues should be reported privately through [SECURITY.md](SECURITY.md). Do not attach logs, cookies, tokens, prompts, responses, source code, or database files to vulnerability reports.

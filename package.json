@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:frontend": "npm run build",
     "check": "npm run build && npm run test:rust",
     "preview": "vite preview",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
