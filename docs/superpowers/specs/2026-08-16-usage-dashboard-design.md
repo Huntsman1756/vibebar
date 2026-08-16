@@ -10,9 +10,11 @@ VibeBar already collects two independent local sources:
 
 - Codex App Server rate-limit windows through `account/rateLimits/read`.
 - OpenCode's bounded 30-day model statistics through `opencode stats --pure --days 30 --models`.
-- OpenCode's local read-only session database, when present, for agent/model attribution and token counters.
+- OpenCode's local read-only SQLite database, when present, for agent/model attribution and token counters.
 
 It also accepts bounded local orchestration events containing a provider, model, role, task, outcome, and optional token usage. The current UI presents the full dashboard when the tray icon is clicked, but it does not yet provide a compact menu-bar summary, a token breakdown by agent/role, or model-level NaN quota percentages.
+
+The next increment adds a bounded historical view and repository attribution. OpenCode stores the local project directory and provider/model metadata alongside session and assistant-message aggregates. VibeBar can resolve a sanitized repository identifier from that directory without contacting GitHub or exposing the absolute path.
 
 ## Goals
 
@@ -22,14 +24,18 @@ It also accepts bounded local orchestration events containing a provider, model,
 4. Show NaN model usage and documented quota percentages when a quota is known.
 5. Use `input + output` as the quota numerator. Show `cache read` and `cache write` separately and never include them in the quota percentage.
 6. Show which agent/role, provider, and model have consumed the local orchestration token telemetry.
-7. Keep the app local-first: no browser-cookie extraction, credential copying, network relay, or invented fallback values.
+7. Show historical usage for today, the last 7 days, the last 30 days, and the current calendar month, grouped by provider, model, agent, and repository.
+8. Distinguish NaN from OpenCode Go using the provider identity present in local OpenCode data, without claiming a billing plan that the source does not prove.
+9. Keep the app local-first: no browser-cookie extraction, credential copying, network relay, or invented fallback values.
+10. Keep the public repository publishable: explicit license, privacy/security guidance, sanitized examples, reproducible CI, and no machine-specific data.
 
 ## Non-goals
 
 - Reading `auth.json`, browser cookies, API keys, prompts, responses, source code, or terminal history.
 - Claiming a ChatGPT subscription renewal date when Codex App Server does not expose one.
 - Treating OpenCode's rolling 30-day report as an exact NaN billing-period ledger.
-- Reading OpenCode message, part, prompt, response, source, or transcript tables; the agent collector only queries bounded aggregate columns from the session table.
+- Reading raw OpenCode message, part, prompt, response, source, or transcript content. A metadata-only query over assistant messages is allowed when it selects only timestamp, provider, model, agent, token counters, and source-provided cost fields.
+- Persisting or returning an absolute project path. Repository attribution exposes only a normalized identifier such as `github.com/owner/repository` or `local/project-name`.
 - Adding a hosted backend, analytics service, or remote authentication flow.
 
 ## User experience
@@ -61,6 +67,12 @@ The main window keeps the current visual language and adds:
 
 The UI uses “sin cuota conocida” rather than “unlimited” when NaN documentation does not publish a monthly allowance.
 
+### Historical usage
+
+The full dashboard adds a period selector with `Today`, `7 days`, `30 days`, and `This month`. The default chart shows daily billable tokens by provider for the selected period. Supporting tables can break the same period down by provider, model, agent, and normalized repository identifier. Cache read/write totals, message counts, session counts, and optional source-provided costs remain separate metrics.
+
+The popover stays compact: it shows the current period total, the leading providers, and the top repositories. The full dashboard is the place for the chart and cross-filters.
+
 ## Metric semantics
 
 For every token object:
@@ -78,6 +90,15 @@ remainingPercent = max(0, 100 - usedPercent)
 
 The percentage is allowed to exceed 100 in the detailed model view so an exhausted quota is visible; compact progress bars are visually capped at 100. The label identifies the observed source period (currently rolling 30 days) and the published quota period when those periods may differ.
 
+Historical windows use the operating system's local calendar:
+
+- `Today`: from local midnight through the current time.
+- `7 days`: the current local day plus the six preceding local calendar days.
+- `30 days`: the current local day plus the 29 preceding local calendar days.
+- `This month`: from the first day of the current local month through the current time.
+
+The backend returns bounded daily buckets for the most recent 31 local calendar days. The frontend derives the four views from that common series so cards, charts, and tables reconcile. A bucket's source timestamp is the assistant-message timestamp when metadata is available; a session-update timestamp is used only by the explicitly labelled lower-fidelity fallback.
+
 The initial NaN quota map follows the published model documentation:
 
 - `deepseek-v4-flash`: 500M tokens per member/month.
@@ -89,13 +110,36 @@ If a future documentation change invalidates a quota, the map is updated in one 
 
 ## Agent attribution
 
-OpenCode's session database is the first-class source for OpenCode agent attribution. The collector reads only `agent`, `model`, session count, timestamp, and token counter columns from the local `session` table. It never reads message/part payloads. Aggregation is limited to the most recent 30 days and groups by:
+OpenCode's local database is the first-class source for OpenCode agent attribution and historical usage. The preferred adapter performs a metadata-only query over assistant messages, joining to the session row only for the in-memory project directory and session fallback fields. It extracts only `time_created`, `role`, `agent`, `modelID`, `providerID`, token counters, and source-provided cost values. It never returns the raw `data` JSON, prompts, responses, paths, or tool content to Rust application state or the frontend.
+
+When the assistant-message metadata query is unavailable because of an older schema or a locked database, the adapter falls back to bounded aggregate columns from `session` (`agent`, `model`, timestamps, directory used only transiently for repository resolution, session count, and token counters). The fallback is labelled lower fidelity because a whole session may be assigned to its last update day.
+
+The preferred aggregation is limited to the most recent 31 local calendar days and groups by:
 
 ```text
-agent + provider + model
+local-day + repository + agent + provider + model
 ```
 
-The database's session count is reported as calls and sessions. Its stored input/output/cache counters are copied without including cache in the billable quota numerator. If the database is unavailable, valid VibeBar events remain the fallback: calls come from `attempt_started`, tokens are summed from event token objects, and groups use `role + provider + model`.
+The database's assistant-message count, session count, and optional source-provided cost are reported under distinct labels. Input/output/cache counters are copied without including cache in the billable quota numerator. If the database is unavailable, valid VibeBar events remain the fallback: calls come from `attempt_started`, tokens are summed from event token objects, and groups use `role + provider + model`; repository attribution is absent unless a future event version provides an explicit sanitized repository identifier.
+
+Provider identity is normalized without collapsing unknown values:
+
+- `nan` renders as `NaN`.
+- `opencode-go` renders as `OpenCode Go`.
+- Any other provider ID remains visible with a humanized label and its original source ID.
+
+OpenCode Go's constant proxy provider can still expose the underlying model through the assistant-message `modelID`; VibeBar records both provider and model when the source supplies them. The UI may show an optional cost field only when OpenCode provides a value. It must not infer “paid” or estimate an invoice from token counts alone.
+
+### Repository attribution
+
+For each OpenCode session, VibeBar uses the local project directory only in memory to resolve a repository identity. Resolution order:
+
+1. Read the local Git `origin` remote from `.git/config` (including worktree indirection when available).
+2. Normalize common SSH and HTTPS GitHub URLs to `github.com/owner/repository`.
+3. Preserve a non-GitHub host as `host/owner/repository` when the URL has that shape.
+4. Fall back to `local/<directory-name>` when there is no remote or the directory is unavailable.
+
+The absolute path is never serialized, stored in VibeBar telemetry, shown in the UI, or included in fixtures. Repository identifiers are local-only dashboard data; VibeBar never calls GitHub, tests repository visibility, or sends the identifier over the network. A configuration switch may disable repository attribution entirely, in which case the UI groups the row under `Repository attribution disabled`.
 
 OpenCode model statistics remain the authoritative provider/model total. Database agent rows are not merged with event rows for the same OpenCode agent/provider/model key, preventing double counting. Event rows for other providers remain visible.
 
@@ -106,7 +150,10 @@ Extend the provider-neutral snapshot with:
 - A token-semantic helper or equivalent serialized fields for billable/cache totals.
 - Per-model quota windows where a model has more than one documented limit; each window can explicitly mark its percentage as unavailable when the local source does not provide the required time bucket.
 - `agentUsage`, containing role/agent label, provider, model, calls, distinct tasks, and token counters.
-- A bounded OpenCode database adapter that resolves the known local data paths and uses a read-only SQLite connection against the session aggregate columns only.
+- A bounded `usageHistory` series of daily provider/model/agent/repository buckets for the last 31 local calendar days, with token counters, assistant-message count, session count, source, and optional source-provided cost.
+- An explicit provider identity/label and source-fidelity field so NaN, OpenCode Go, unknown providers, message metadata, and session fallback remain distinguishable.
+- A bounded OpenCode database adapter that resolves the known local data paths and uses a read-only SQLite connection. The preferred query extracts only whitelisted assistant-message metadata; the session aggregate query remains the compatibility fallback.
+- An in-memory repository resolver that reads Git metadata without returning absolute paths and caches each directory resolution during a snapshot refresh.
 
 Keep old telemetry rows readable. Any new serialized event field must be optional and backward-compatible, or use a versioned schema if the event contract needs a required semantic change. Existing validation, line limits, idempotency, and credential-scrubbed subprocess environments remain in force.
 
@@ -128,8 +175,21 @@ The Rust snapshot builder aggregates agent usage independently from provider col
 - Missing quotas render “sin cuota conocida” rather than an unlimited claim.
 - Missing reset timestamps render “reset desconocido”.
 - The app never stores or transmits credentials, prompts, responses, or source data.
-- The OpenCode agent collector never queries the `message` or `part` tables and never serializes transcript fields.
+- The OpenCode metadata collector may query assistant-message rows only through a fixed whitelist of JSON fields: timestamp, role, agent, model ID, provider ID, token counters, and source-provided cost. It never returns raw message JSON or reads `part` payloads.
+- Repository resolution is local-only and path-minimizing: absolute paths are transient inputs, normalized identifiers are the only output, and no remote GitHub request is made.
 - The popover and full dashboard use the same local snapshot and do not add a new network surface.
+
+## Public repository hygiene
+
+The public repository must contain only reusable product code and documentation:
+
+- Add an MIT `LICENSE` with a repository-level copyright holder that does not expose private user information.
+- Keep the README focused on features, installation, data sources, metric semantics, privacy boundaries, limitations, contribution commands, and license.
+- Add `SECURITY.md` with supported versions, private vulnerability-reporting guidance, and a warning not to attach logs, cookies, tokens, prompts, or database files.
+- Add `CONTRIBUTING.md` with reproducible setup, formatting, tests, build commands, fixture-sanitization rules, and pull-request expectations.
+- Remove internal implementation-process documents from the public release or replace them with concise architecture documentation; no personal workspace paths, live usage values, temporary worktree names, or private repository identifiers may enter fixtures or docs.
+- Keep CI read-only and reproducible. It must run frontend build, Rust formatting, Rust tests, and Clippy on the supported matrix without needing provider credentials.
+- Do not add browser cookies, API keys, local database copies, generated application bundles, or account-specific configuration to Git.
 
 ## Verification and acceptance criteria
 
@@ -139,6 +199,10 @@ Backend tests must cover:
 - NaN quota mapping includes the documented models and leaves unknown quotas unset.
 - Multi-window model quotas can be represented without losing the monthly/rolling distinction.
 - Agent aggregation groups by role/provider/model, counts attempts and distinct tasks, and restricts to the 30-day window.
+- Provider normalization keeps `nan`, `opencode-go`, and unknown providers distinct.
+- Metadata-only assistant-message aggregation produces daily provider/model/agent/repository buckets and never exposes raw message data.
+- Repository URL normalization handles GitHub SSH/HTTPS, non-GitHub remotes, no remote, worktree paths, and disabled attribution without returning absolute paths.
+- Today, 7-day, 30-day, and current-month boundaries use the local calendar and reconcile to the same daily series.
 - Existing telemetry validation, idempotency, and collector handshake tests continue to pass.
 
 Frontend/build verification must cover:
@@ -147,8 +211,9 @@ Frontend/build verification must cover:
 - Rust unit tests and formatting.
 - Tauri release build.
 - A real installed macOS app: tray click opens only the compact popover; “Open full dashboard” opens the large window; both providers render live status when their CLIs are available.
+- Historical dashboard verification with sanitized fixture data for NaN, OpenCode Go, an unknown provider, two repositories, and multiple agents.
 - Error states for missing Codex/OpenCode remain legible in both views.
 
 ## Delivery
 
-Implementation is performed on `agent/usage-dashboard`, preserving the current local collector fixes. After verification, changes are committed intentionally, pushed to GitHub, and submitted as a draft pull request against `Huntsman1756/vibebar` rather than mutating `main` directly.
+Implementation follows the repository's normal review workflow, preserving the current local collector fixes. The public branch must be verified before any release or merge, and the final repository must not contain account-specific machine data.
