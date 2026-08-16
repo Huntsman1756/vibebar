@@ -38,6 +38,9 @@ src-tauri/*.db-journal
 src-tauri/*.sqlite-shm
 src-tauri/*.sqlite-wal
 src-tauri/*.sqlite-journal
+# Keep sanitized sample databases under examples/ trackable.
+!examples/
+!examples/**
 src-tauri/target/**/bundle/
 src-tauri/target/**/bundle-debug/
 src-tauri/target/**/bundle/release/
