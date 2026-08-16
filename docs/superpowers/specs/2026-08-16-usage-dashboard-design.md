@@ -21,8 +21,8 @@ The next increment adds a bounded historical view and repository attribution. Op
 1. Make a tray click show a small, fast dashboard instead of opening the large window.
 2. Keep a deliberate action for opening the full dashboard.
 3. Show available ChatGPT/Codex subscription capacity and reset windows without pretending that rate limits are token totals.
-4. Show NaN model usage and documented quota percentages when a quota is known.
-5. Use `input + output` as the quota numerator. Show `cache read` and `cache write` separately and never include them in the quota percentage.
+4. Show NaN model usage with exact input, output, reasoning, cache, and observed-total counters when the source supplies them.
+5. Show a quota percentage only when an authoritative provider meter supplies both usage and limit for the same period; a published allowance alone is not a usable meter.
 6. Show which agent/role, provider, and model have consumed the local orchestration token telemetry.
 7. Show historical usage for today, the last 7 days, the last 30 days, and the current calendar month, grouped by provider, model, agent, and repository.
 8. Distinguish NaN from OpenCode Go using the provider identity present in local OpenCode data, without claiming a billing plan that the source does not prove.
@@ -48,8 +48,8 @@ The popover contains:
 
 - A compact header with VibeBar, last refresh time, and refresh action.
 - A ChatGPT/Codex card with the available percentage and reset countdown for each exposed rate-limit window.
-- A NaN card with the top model quotas, remaining percentage, used tokens, and a separate cache total.
-- A short “top agents / roles” list for the last 30 days, ranked by billable tokens and then calls.
+- A NaN card with observed tokens, primary traffic, reasoning, cache, and an authoritative remaining percentage only when the provider supplies one.
+- A short “top agents / roles” list for the last 30 days, ranked by observed tokens and then calls.
 - An explicit “Open full dashboard” action.
 - A small diagnostics link/summary when a collector is unavailable.
 
@@ -59,17 +59,19 @@ The existing tray menu's “Open VibeBar” action continues to open and focus t
 
 The main window keeps the current visual language and adds:
 
-- Provider cards with billable tokens, cache read/write totals, calls, model rows, quota bars, and clear source/freshness labels.
-- NaN model rows with a percentage only when a documented quota is configured.
-- An “Agents and roles” panel with provider/model context, calls, tasks, billable tokens, and cache tokens.
+- Provider cards with observed tokens, primary traffic, reasoning, cache read/write totals, calls, model rows, authoritative quota bars when available, and clear source/freshness labels.
+- NaN model rows with a percentage only when an authoritative provider meter covers the same period.
+- An “Agents and roles” panel with provider/model context, calls, tasks, primary traffic, reasoning, cache, and observed tokens.
 - A clear empty state explaining that agent attribution requires VibeBar events with role and optional token fields.
 - The existing orchestration outcome metrics, recent event stream, telemetry path, and diagnostics.
 
-The UI uses “sin cuota conocida” rather than “unlimited” when NaN documentation does not publish a monthly allowance.
+The UI uses “sin cuota conocida” when NaN documentation does not publish an
+allowance and “cuota no medible con datos locales” when an allowance exists but
+no authoritative meter is available. It never says “unlimited”.
 
 ### Historical usage
 
-The full dashboard adds a period selector with `Today`, `7 days`, `30 days`, and `This month`. The default chart shows daily billable tokens by provider for the selected period. Supporting tables can break the same period down by provider, model, agent, and normalized repository identifier. Cache read/write totals, message counts, session counts, and optional source-provided costs remain separate metrics.
+The full dashboard adds a period selector with `Today`, `7 days`, `30 days`, and `This month`. The default chart shows daily observed tokens by provider for the selected period. Supporting tables can break the same period down by provider, model, agent, and normalized repository identifier. Primary traffic, reasoning, cache read/write totals, message counts, session counts, and optional source-provided costs remain separately visible metrics.
 
 The popover stays compact: it shows the current period total, the leading providers, and the top repositories. The full dashboard is the place for the chart and cross-filters.
 
@@ -77,18 +79,21 @@ The popover stays compact: it shows the current period total, the leading provid
 
 For every token object:
 
-- **Billable tokens:** `inputTokens + outputTokens`.
+- **Primary traffic:** `inputTokens + outputTokens`.
+- **Reasoning tokens:** the source-provided reasoning counter.
 - **Cache tokens:** `cacheReadTokens + cacheWriteTokens`.
-- **All observed tokens:** billable tokens plus cache tokens, used only as a supplementary total.
+- **Observed total:** primary traffic plus reasoning and cache tokens.
 
-For a model with a configured quota:
+OpenCode's textual statistics may fold reasoning into output while its local
+database exposes reasoning separately. VibeBar normalizes each adapter exactly
+once and tests reconciliation, so the same counter is never omitted or counted
+twice.
 
-```text
-usedPercent = billableTokens / quotaTokens * 100
-remainingPercent = max(0, 100 - usedPercent)
-```
-
-The percentage is allowed to exceed 100 in the detailed model view so an exhausted quota is visible; compact progress bars are visually capped at 100. The label identifies the observed source period (currently rolling 30 days) and the published quota period when those periods may differ.
+A quota percentage is available only when a provider-authoritative source
+returns both used and limit values for the same window. Published model
+allowances remain reference metadata; VibeBar never selects a local token
+counter as a guessed quota numerator. Without an authoritative meter the UI
+shows `cuota no medible con datos locales` and no progress percentage.
 
 Historical windows use the operating system's local calendar:
 
@@ -99,14 +104,18 @@ Historical windows use the operating system's local calendar:
 
 The backend returns bounded daily buckets for the most recent 31 local calendar days. The frontend derives the four views from that common series so cards, charts, and tables reconcile. A bucket's source timestamp is the assistant-message timestamp when metadata is available; a session-update timestamp is used only by the explicitly labelled lower-fidelity fallback.
 
-The initial NaN quota map follows the published model documentation:
+The initial NaN allowance reference follows the published model documentation:
 
 - `deepseek-v4-flash`: 500M tokens per member/month.
 - `mimo-v2.5`: 1B tokens per member/month.
-- `glm5.2`: 3B tokens per member/billing period, plus a documented 400M rolling four-hour window. The current OpenCode 30-day aggregate cannot calculate a truthful four-hour percentage, so that secondary limit is shown as documented but locally unmetered until a time-bucketed source exists.
-- `qwen3.6` and `gemma4`: no published monthly token allowance; show usage without a percentage.
+- `glm5.2`: 3B tokens per member/billing period, plus a documented 400M rolling four-hour window.
+- `qwen3.6` and `gemma4`: no published monthly token allowance.
 
-If a future documentation change invalidates a quota, the map is updated in one collector module and the UI remains provider-neutral.
+These references never create a percentage by themselves. Every model shows
+observed local counters; only a future authoritative provider meter may add a
+quota percentage.
+
+If a future documentation change invalidates an allowance reference, the map is updated in one collector module and the UI remains provider-neutral.
 
 ## Agent attribution
 
@@ -120,7 +129,7 @@ The preferred aggregation is limited to the most recent 31 local calendar days a
 local-day + repository + agent + provider + model
 ```
 
-The database's assistant-message count, session count, and optional source-provided cost are reported under distinct labels. Input/output/cache counters are copied without including cache in the billable quota numerator. If the database is unavailable, valid VibeBar events remain the fallback: calls come from `attempt_started`, tokens are summed from event token objects, and groups use `role + provider + model`; repository attribution is absent unless a future event version provides an explicit sanitized repository identifier.
+The database's assistant-message count, session count, and optional source-provided cost are reported under distinct labels. Input/output/reasoning/cache counters are copied without inferring a quota numerator. If the database is unavailable, valid VibeBar events remain the fallback: calls come from `attempt_started`, tokens are summed from event token objects, and groups use `role + provider + model`; repository attribution is absent unless a future event version provides an explicit sanitized repository identifier.
 
 Provider identity is normalized without collapsing unknown values:
 
@@ -147,9 +156,9 @@ OpenCode model statistics remain the authoritative provider/model total. Databas
 
 Extend the provider-neutral snapshot with:
 
-- A token-semantic helper or equivalent serialized fields for billable/cache totals.
-- Per-model quota windows where a model has more than one documented limit; each window can explicitly mark its percentage as unavailable when the local source does not provide the required time bucket.
-- `agentUsage`, containing role/agent label, provider, model, calls, distinct tasks, and token counters.
+- A token-semantic helper or equivalent serialized fields for primary, reasoning, cache, and observed totals.
+- Per-model allowance windows where a model has more than one documented limit; each window explicitly marks its percentage unavailable unless an authoritative provider meter covers that window.
+- `agentUsage`, containing role/agent label, provider, model, calls, distinct tasks, and input/output/reasoning/cache token counters.
 - A bounded `usageHistory` series of daily provider/model/agent/repository buckets for the last 31 local calendar days, with token counters, assistant-message count, session count, source, and optional source-provided cost.
 - An explicit provider identity/label and source-fidelity field so NaN, OpenCode Go, unknown providers, message metadata, and session fallback remain distinguishable.
 - A bounded OpenCode database adapter that resolves the known local data paths and uses a read-only SQLite connection. The preferred query extracts only whitelisted assistant-message metadata; the session aggregate query remains the compatibility fallback.
@@ -195,8 +204,9 @@ The public repository must contain only reusable product code and documentation:
 
 Backend tests must cover:
 
-- Billable percentage excludes cache read/write.
-- NaN quota mapping includes the documented models and leaves unknown quotas unset.
+- Input, output, reasoning, cache, and observed totals reconcile without omission or double counting across adapters.
+- NaN allowance references include the documented models but never create a percentage without an authoritative provider meter.
+- Quota percentage remains unavailable when only local counters and a published allowance are present.
 - Multi-window model quotas can be represented without losing the monthly/rolling distinction.
 - Agent aggregation groups by role/provider/model, counts attempts and distinct tasks, and restricts to the 30-day window.
 - Provider normalization keeps `nan`, `opencode-go`, and unknown providers distinct.
