@@ -56,4 +56,6 @@ Unknown fields are rejected. Identifiers are non-empty, bounded, and cannot cont
 - **Escalations:** `escalated` events, including economy-model escalation or frontier escalation as described by `role`.
 - **Cost per accepted:** sum of provided `costMicrousd` divided by accepted tasks. It remains unavailable when the source does not provide cost.
 
+When `tokens` is present, VibeBar reports **billable tokens** as `inputTokens + outputTokens` and keeps `cacheReadTokens + cacheWriteTokens` as a separate cache metric. Cache tokens are never included in a provider quota percentage. The dashboard groups token-bearing events by `role`, `provider`, and `model` over the most recent 30 days for agent/role attribution; OpenCode's independent 30-day provider totals are not merged into those event groups.
+
 V1 does not cryptographically sign events. If events later cross a user or machine trust boundary, introduce a V2 envelope with producer identity, sequence, previous hash, and signature instead of weakening V1 parsing.

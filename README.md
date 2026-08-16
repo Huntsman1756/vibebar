@@ -45,7 +45,13 @@ The command prints the number of newly appended events. Replaying the same file 
 | OpenCode stats | Calls and input/output/cache tokens by provider and model over 30 days | A rolling 30-day total is not necessarily the provider billing period |
 | VibeBar events | Attempts, acceptance, rejections, failures, escalations, duration, and optional cost | Requires the orchestrator to append the V1 events |
 
-NaN quota references currently include `deepseek-v4-flash` at 500M tokens/member/month and `mimo-v2.5` at 1B tokens/member/month, as published in the [NaN model documentation](https://nan.builders/docs/models). The docs publish throughput but no monthly token allowance for `qwen3.6`, so VibeBar deliberately shows “No monthly cap published” instead of assuming unlimited use.
+### Tray popover and usage semantics
+
+Clicking the macOS tray icon opens a compact popover with ChatGPT/Codex capacity, NaN model usage, and the top agent/role spend. The “Open full dashboard” button opens the detailed window; the tray click no longer opens that large window directly.
+
+Quota percentages use only `input + output` tokens. `cache read` and `cache write` are displayed separately and never inflate a quota percentage. Agent attribution comes from the event `role` grouped with its provider and model over the last 30 days; provider/model totals from OpenCode are not silently counted again as agent spend.
+
+NaN quota references include `deepseek-v4-flash` at 500M tokens/member/month, `mimo-v2.5` at 1B tokens/member/month, and `glm5.2` at 3B tokens/member/billing period, as published in the [NaN model documentation](https://nan.builders/docs/models). NaN also publishes a 400M rolling four-hour limit for `glm5.2`, but the current OpenCode source is a 30-day aggregate and cannot calculate a truthful four-hour percentage; VibeBar marks that window as locally unmetered. The docs publish no monthly token allowance for `qwen3.6` or `gemma4`, so VibeBar shows “No known quota” instead of assuming unlimited use.
 
 See [docs/telemetry-v1.md](docs/telemetry-v1.md) for the event contract and [docs/threat-model.md](docs/threat-model.md) for trust boundaries.
 
