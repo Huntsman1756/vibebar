@@ -15,19 +15,24 @@ const bannedFixturePattern = new RegExp(
 
 describe("usage-history fixture", () => {
   it("covers the sanitized repository history scenarios", () => {
+    const eventFallbackRows = fixture.rows.filter((row) => row.sourceFidelity === "event-fallback");
+
     expect(fixture.repositoryAttributionEnabled).toBe(true);
     expect(fixture.oldestDay).toBe("2026-07-18");
     expect(fixture.newestDay).toBe("2026-08-16");
     expect(new Set(fixture.rows.map((row) => row.provider))).toEqual(new Set(["nan", "opencode-go", "custom-provider"]));
     expect(new Set(fixture.rows.map((row) => row.agent))).toEqual(new Set(["executor", "reviewer"]));
     expect(new Set(fixture.rows.map((row) => row.repository))).toEqual(
-      new Set(["github.com/example/alpha", "local/demo-project"]),
+      new Set(["github.com/example/alpha", "local/demo-project", "Repository attribution disabled"]),
     );
     expect(new Set(fixture.rows.map((row) => row.day)).size).toBeGreaterThan(1);
     expect(fixture.rows.some((row) => row.tokens.cacheReadTokens > 0 || row.tokens.cacheWriteTokens > 0)).toBe(true);
     expect(new Set(fixture.rows.map((row) => row.sourceFidelity))).toEqual(
       new Set(["metadata", "session-fallback", "event-fallback"]),
     );
+    expect(eventFallbackRows.length).toBeGreaterThan(0);
+    expect(eventFallbackRows.every((row) => row.repository === "Repository attribution disabled")).toBe(true);
+    expect(eventFallbackRows.some((row) => row.repository !== "Repository attribution disabled")).toBe(false);
 
     const serialized = JSON.stringify(fixture);
     expect(serialized).not.toMatch(bannedFixturePattern);

@@ -74,7 +74,7 @@
     },
     {
       "day": "2026-08-01",
-      "repository": "github.com/example/alpha",
+      "repository": "Repository attribution disabled",
       "agent": "executor",
       "provider": "custom-provider",
       "model": "glm5.2",
@@ -92,7 +92,7 @@
     },
     {
       "day": "2026-07-18",
-      "repository": "local/demo-project",
+      "repository": "Repository attribution disabled",
       "agent": "reviewer",
       "provider": "opencode-go",
       "model": "qwen3.6",

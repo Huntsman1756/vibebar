@@ -100,3 +100,76 @@ Required repo-wide privacy scan from the brief:
 ## Concerns
 
 - The exact repo-wide privacy scan is still noisy because the retained implementation plan intentionally contains the scan text and older sample/test identifiers still collide with the `sk-...` heuristic. I did not widen Task 7 into unrelated product-code cleanup to remove those existing false positives.
+
+## Round 1 Fix
+
+Date: August 16, 2026
+Parent commit: `9120dd4faef37253e71a9dd39bcd441ff5b754ae`
+
+### Scope
+
+- Replaced concrete repository identifiers on every public `event-fallback` fixture row with the exact sentinel `Repository attribution disabled`.
+- Tightened the focused fixture regression so event-fallback rows must all use the sentinel and cannot carry repository attribution.
+- Aligned the synthetic `event-fallback` demo row in `src/demo.ts` to the same sentinel so the public preview data matches product semantics.
+
+### RED Evidence
+
+Focused regression after tightening the test and before updating the fixture:
+
+```text
+$ rtk npm run test:frontend -- src/usageHistoryFixture.test.ts
+ FAIL  src/usageHistoryFixture.test.ts > usage-history fixture > covers the sanitized repository history scenarios
+ AssertionError: expected Set{ 'github.com/example/alpha', …(1) } to deeply equal Set{ 'github.com/example/alpha', …(2) }
+ - Expected
+ + Received
+   Set {
+ -   "Repository attribution disabled",
+     "github.com/example/alpha",
+     "local/demo-project",
+   }
+```
+
+This verified the mismatch: the test correctly demanded the sentinel, but the fixture still exposed concrete repository identifiers on event-fallback rows.
+
+### GREEN Evidence
+
+Focused regression after the fixture/demo fix:
+
+```text
+$ rtk npm run test:frontend -- src/usageHistoryFixture.test.ts
+ ✓ src/usageHistoryFixture.test.ts (2 tests)
+ Test Files  1 passed (1)
+      Tests  2 passed (2)
+```
+
+Full frontend suite:
+
+```text
+$ rtk npm run test:frontend
+ ✓ src/history.test.ts (9 tests)
+ ✓ src/usageHistoryFixture.test.ts (2 tests)
+ Test Files  2 passed (2)
+      Tests  11 passed (11)
+```
+
+Production build:
+
+```text
+$ rtk npm run build
+ vite v7.3.6 building client environment for production...
+ ✓ built in 379ms
+```
+
+Rust suite:
+
+```text
+$ rtk cargo test --manifest-path src-tauri/Cargo.toml
+cargo test: 47 passed (4 suites, 0.48s)
+```
+
+Whitespace / diff hygiene:
+
+```text
+$ rtk git diff --check
+[no output]
+```
