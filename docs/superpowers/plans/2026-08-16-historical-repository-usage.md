@@ -410,7 +410,7 @@ Expected: all selector tests pass and TypeScript/Vite production build succeeds.
 - Modify: `docs/telemetry-v1.md`
 - Create: `examples/usage-history-v1.json`
 - Modify: `src-tauri/src/bin/vibebar-ingest.rs` only if the fixture smoke path needs an explicit mode
-- Delete: `docs/superpowers/plans/2026-08-16-usage-dashboard.md`, `docs/superpowers/plans/2026-08-16-historical-repository-usage.md`, and `docs/superpowers/specs/2026-08-16-usage-dashboard-design.md` from the final public tree after their reusable architecture content is represented in `docs/architecture.md`
+- Delete: superseded internal `docs/superpowers/plans/2026-08-16-usage-dashboard.md` from the final public tree; retain the approved design specification and active implementation plan until branch review is complete so the review ledger remains reproducible.
 
 **Interfaces:**
 - Documentation must distinguish `session` fallback from assistant-message metadata history.
