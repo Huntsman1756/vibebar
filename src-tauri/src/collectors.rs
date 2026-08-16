@@ -321,10 +321,6 @@ pub fn allowance_windows_for(provider: &str, model: &str) -> Vec<ModelQuota> {
     }
 }
 
-pub fn quota_windows_for(provider: &str, model: &str, _primary_tokens: u64) -> Vec<ModelQuota> {
-    allowance_windows_for(provider, model)
-}
-
 fn sum_tokens<'a>(tokens: impl Iterator<Item = &'a TokenUsage>) -> TokenUsage {
     tokens.fold(
         TokenUsage {
