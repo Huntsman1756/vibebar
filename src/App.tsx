@@ -2,11 +2,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 import { demoSnapshot } from "./demo";
-import type { DashboardSnapshot, ModelUsage, ProviderSnapshot, QuotaWindow } from "./types";
+import type { AgentUsage, DashboardSnapshot, ModelQuota, ModelUsage, ProviderSnapshot, QuotaWindow } from "./types";
 
 const compact = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
 const percent = new Intl.NumberFormat("en", { style: "percent", maximumFractionDigits: 0 });
 const formatTokens = (value: number) => `${compact.format(value)} tok`;
+const billableTokens = (tokens: { inputTokens: number; outputTokens: number }) => tokens.inputTokens + tokens.outputTokens;
+const cacheTokens = (tokens: { cacheReadTokens: number; cacheWriteTokens: number }) => tokens.cacheReadTokens + tokens.cacheWriteTokens;
+const quotaPercent = (value: number | null) => value == null ? "—" : `${value.toFixed(value < 10 ? 1 : 0)}%`;
 
 function resetLabel(unix: number | null) {
   if (!unix) return "Reset unknown";
@@ -27,17 +30,27 @@ function WindowMeter({ window }: { window: QuotaWindow }) {
   </div>;
 }
 
+function QuotaMeter({ quota }: { quota: ModelQuota }) {
+  const limited = quota.usedPercent != null && quota.usedPercent > 80;
+  return <div className="quota-row">
+    <div className="quota-copy"><span>{quota.label}</span><small>{quota.periodLabel}</small></div>
+    <div className="quota-value">{quotaPercent(quota.usedPercent)}</div>
+    {quota.usedPercent == null ? <small className="quota-unavailable">Local window unavailable</small> : <div className="quota-progress"><Progress value={quota.usedPercent} tone={limited ? "amber" : "violet"} /><small>{quotaPercent(quota.remainingPercent)} left</small></div>}
+  </div>;
+}
+
 function ModelRow({ model }: { model: ModelUsage }) {
-  const used = model.tokens.inputTokens + model.tokens.outputTokens;
-  const quotaPercent = model.quotaTokens ? (used / model.quotaTokens) * 100 : null;
+  const billable = billableTokens(model.tokens);
+  const cache = cacheTokens(model.tokens);
   return <div className="model-row">
-    <div className="model-main"><span className="model-dot" /><div><strong>{model.model}</strong><small>{compact.format(model.calls)} calls · {formatTokens(used)}</small></div></div>
-    {quotaPercent === null ? <span className="limit-pill">No monthly cap published</span> : <div className="model-quota"><span>{Math.min(quotaPercent, 999).toFixed(quotaPercent < 10 ? 1 : 0)}%</span><Progress value={quotaPercent} /></div>}
+    <div className="model-main"><span className="model-dot" /><div><strong>{model.model}</strong><small>{compact.format(model.calls)} calls · {formatTokens(billable)} billable</small><small className="token-secondary">{formatTokens(cache)} cache</small></div></div>
+    {model.quotaWindows.length === 0 ? <span className="limit-pill">No known quota</span> : <div className="quota-stack">{model.quotaWindows.map((quota) => <QuotaMeter key={`${model.model}-${quota.label}`} quota={quota} />)}</div>}
   </div>;
 }
 
 function ProviderCard({ provider }: { provider: ProviderSnapshot }) {
-  const total = provider.tokens.inputTokens + provider.tokens.outputTokens;
+  const total = billableTokens(provider.tokens);
+  const cache = cacheTokens(provider.tokens);
   return <article className={`provider-card ${provider.status === "error" ? "provider-error" : ""}`}>
     <header>
       <div className={`provider-mark ${provider.id === "nan" ? "nan" : "chatgpt"}`}>{provider.id === "nan" ? "N" : "✦"}</div>
@@ -46,8 +59,15 @@ function ProviderCard({ provider }: { provider: ProviderSnapshot }) {
     </header>
     {provider.error ? <p className="provider-error-copy">{provider.error}</p> : null}
     {provider.windows.length > 0 ? <div className="window-grid">{provider.windows.map((window) => <WindowMeter key={window.label} window={window} />)}</div> : null}
-    {provider.models.length > 0 ? <><div className="provider-total"><div><span>30-day model traffic</span><strong>{formatTokens(total)}</strong></div><div><span>Calls</span><strong>{compact.format(provider.calls)}</strong></div></div><div className="model-list">{provider.models.slice(0, 5).map((model) => <ModelRow key={model.model} model={model} />)}</div></> : null}
+    {provider.models.length > 0 ? <><div className="provider-total"><div><span>30-day billable traffic</span><strong>{formatTokens(total)}</strong></div><div><span>Cache read/write</span><strong className="token-secondary">{formatTokens(cache)}</strong></div><div><span>Calls</span><strong>{compact.format(provider.calls)}</strong></div></div><div className="model-list">{provider.models.slice(0, 5).map((model) => <ModelRow key={model.model} model={model} />)}</div></> : null}
   </article>;
+}
+
+function AgentUsagePanel({ usage }: { usage: AgentUsage[] }) {
+  return <section className="agent-panel">
+    <div className="section-head compact"><div><p className="eyebrow">AGENTS / ROLES</p><h2>Who spent the tokens</h2></div><span>Last 30 days</span></div>
+    {usage.length === 0 ? <div className="empty agent-empty"><span>⌁</span><strong>No agent token attribution yet</strong><p>Append VibeBar events with a role and optional token usage to see which agents are spending.</p></div> : <div className="agent-list">{usage.slice(0, 12).map((item) => <div className="agent-row" key={`${item.agent}-${item.provider}-${item.model}`}><div className="agent-identity"><span className="agent-mark">{item.agent.slice(0, 1).toUpperCase()}</span><div><strong>{item.agent}</strong><small>{item.provider} / {item.model}</small></div></div><div className="agent-stat"><span>{formatTokens(billableTokens(item.tokens))}</span><small>billable · {formatTokens(cacheTokens(item.tokens))} cache</small></div><div className="agent-stat compact-stat"><span>{compact.format(item.calls)}</span><small>calls · {compact.format(item.tasks)} tasks</small></div></div>)}</div>}
+  </section>;
 }
 
 function Metric({ label, value, detail, tone }: { label: string; value: string; detail: string; tone?: string }) {
@@ -103,6 +123,8 @@ function App() {
 
     <section className="section-head"><div><p className="eyebrow">LIVE SOURCES</p><h2>Capacity</h2></div><span>Updated {snapshot ? new Date(snapshot.generatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—"}</span></section>
     <section className="provider-grid">{providers.map((provider) => <ProviderCard key={provider.id} provider={provider} />)}{!snapshot && <div className="provider-card skeleton" />}</section>
+
+    <AgentUsagePanel usage={snapshot?.agentUsage ?? []} />
 
     <section className="outcomes-panel">
       <div className="section-head compact"><div><p className="eyebrow">ORCHESTRATION QUALITY</p><h2>Outcome, not just spend</h2></div><span>From bounded JSONL events</span></div>
