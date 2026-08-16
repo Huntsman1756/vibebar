@@ -265,15 +265,18 @@ fn normalize_host_path(host: &str, path: &str) -> Option<String> {
     }
 
     let normalized_path = if let Some(last) = segments.last() {
-        if let Some(stripped) = last.strip_suffix(".git") {
+        if last == &".git" {
+            return None;
+        } else if let Some(stripped) = last.strip_suffix(".git") {
+            if stripped.is_empty() {
+                return None;
+            }
             let mut normalized = segments[..segments.len() - 1].join("/");
             if !normalized.is_empty() {
                 normalized.push('/');
             }
             normalized.push_str(stripped);
             normalized
-        } else if last == &".git" {
-            return None;
         } else {
             segments.join("/")
         }
@@ -351,6 +354,8 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_remote_text() {
+        assert_eq!(normalize_remote_url("git@github.com:.git"), None);
+        assert_eq!(normalize_remote_url("https://github.com/.git"), None);
         assert_eq!(
             normalize_remote_url("git@github.com:Acme/\u{0007}Private.git"),
             None
