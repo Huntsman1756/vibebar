@@ -12,6 +12,7 @@ use std::{
 use chrono::{Duration, Utc};
 use domain::{
     DashboardSnapshot, RecentEvent, UsageEvent, aggregate_agent_usage, aggregate_workflow,
+    merge_agent_usage,
 };
 use tauri::{
     Manager, State,
@@ -24,10 +25,7 @@ struct AppState {
     refresh_lock: Arc<Mutex<()>>,
 }
 
-fn toggle_popover(
-    app: &tauri::AppHandle,
-    tray_position: Option<tauri::PhysicalPosition<f64>>,
-) {
+fn toggle_popover(app: &tauri::AppHandle, tray_position: Option<tauri::PhysicalPosition<f64>>) {
     let Some(popover) = app.get_webview_window("popover") else {
         return;
     };
@@ -38,9 +36,9 @@ fn toggle_popover(
     if let Some(position) = tray_position {
         let x = (position.x - 210.0).max(8.0) as i32;
         let y = (position.y + 8.0).max(8.0) as i32;
-        let _ = popover.set_position(tauri::Position::Physical(
-            tauri::PhysicalPosition::new(x, y),
-        ));
+        let _ = popover.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
+            x, y,
+        )));
     }
     let _ = popover.show();
     let _ = popover.set_focus();
@@ -89,11 +87,19 @@ fn build_snapshot(data_dir: &std::path::Path) -> DashboardSnapshot {
             kind: event.kind.clone(),
         })
         .collect();
+    let event_agent_usage = aggregate_agent_usage(&events, now - Duration::days(30));
+    let agent_usage = match collectors::collect_opencode_agent_usage() {
+        Ok(opencode_usage) => merge_agent_usage(opencode_usage, event_agent_usage),
+        Err(error) => {
+            diagnostics.push(error);
+            event_agent_usage
+        }
+    };
     DashboardSnapshot {
         generated_at: now.to_rfc3339(),
         telemetry_path: storage::telemetry_path(data_dir).display().to_string(),
         providers,
-        agent_usage: aggregate_agent_usage(&events, now - Duration::days(30)),
+        agent_usage,
         workflow: aggregate_workflow(&events),
         recent_events,
         diagnostics,
@@ -143,9 +149,7 @@ fn telemetry_path(state: State<'_, AppState>) -> String {
 pub fn run() {
     tauri::Builder::default()
         .on_window_event(|window, event| {
-            if window.label() == "popover"
-                && matches!(event, tauri::WindowEvent::Focused(false))
-            {
+            if window.label() == "popover" && matches!(event, tauri::WindowEvent::Focused(false)) {
                 let _ = window.hide();
             }
         })

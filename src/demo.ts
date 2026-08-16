@@ -17,9 +17,9 @@ export const demoSnapshot: DashboardSnapshot = {
     ], windows: [], updatedAt: now.toISOString(), error: null },
   ],
   agentUsage: [
-    { agent: "executor", provider: "nan", model: "qwen3.6", calls: 31, tasks: 22, tokens: { inputTokens: 38_400_000, outputTokens: 1_700_000, cacheReadTokens: 94_000_000, cacheWriteTokens: 0 } },
-    { agent: "reviewer", provider: "chatgpt", model: "codex", calls: 18, tasks: 17, tokens: { inputTokens: 8_900_000, outputTokens: 1_200_000, cacheReadTokens: 21_000_000, cacheWriteTokens: 0 } },
-    { agent: "escalationExecutor", provider: "nan", model: "deepseek-v4-flash", calls: 12, tasks: 8, tokens: { inputTokens: 4_700_000, outputTokens: 500_000, cacheReadTokens: 6_000_000, cacheWriteTokens: 0 } },
+    { agent: "executor", provider: "nan", model: "qwen3.6", source: "opencode-db-30d", calls: 31, tasks: 22, tokens: { inputTokens: 38_400_000, outputTokens: 1_700_000, cacheReadTokens: 94_000_000, cacheWriteTokens: 0 } },
+    { agent: "reviewer", provider: "chatgpt", model: "codex", source: "vibebar-events-30d", calls: 18, tasks: 17, tokens: { inputTokens: 8_900_000, outputTokens: 1_200_000, cacheReadTokens: 21_000_000, cacheWriteTokens: 0 } },
+    { agent: "escalationExecutor", provider: "nan", model: "deepseek-v4-flash", source: "vibebar-events-30d", calls: 12, tasks: 8, tokens: { inputTokens: 4_700_000, outputTokens: 500_000, cacheReadTokens: 6_000_000, cacheWriteTokens: 0 } },
   ],
   workflow: { tasks: 42, acceptedTasks: 36, attempts: 61, attemptsPerAccepted: 1.69, acceptanceRate: 0.857, reviewerRejections: 17, mechanicalFailures: 3, escalations: 8, costPerAcceptedMicrousd: 0 },
   recentEvents: [

@@ -10,6 +10,7 @@ VibeBar already collects two independent local sources:
 
 - Codex App Server rate-limit windows through `account/rateLimits/read`.
 - OpenCode's bounded 30-day model statistics through `opencode stats --pure --days 30 --models`.
+- OpenCode's local read-only session database, when present, for agent/model attribution and token counters.
 
 It also accepts bounded local orchestration events containing a provider, model, role, task, outcome, and optional token usage. The current UI presents the full dashboard when the tray icon is clicked, but it does not yet provide a compact menu-bar summary, a token breakdown by agent/role, or model-level NaN quota percentages.
 
@@ -28,7 +29,7 @@ It also accepts bounded local orchestration events containing a provider, model,
 - Reading `auth.json`, browser cookies, API keys, prompts, responses, source code, or terminal history.
 - Claiming a ChatGPT subscription renewal date when Codex App Server does not expose one.
 - Treating OpenCode's rolling 30-day report as an exact NaN billing-period ledger.
-- Inferring an agent name when the source only supplies a model or no role metadata.
+- Reading OpenCode message, part, prompt, response, source, or transcript tables; the agent collector only queries bounded aggregate columns from the session table.
 - Adding a hosted backend, analytics service, or remote authentication flow.
 
 ## User experience
@@ -88,15 +89,15 @@ If a future documentation change invalidates a quota, the map is updated in one 
 
 ## Agent attribution
 
-The existing event contract's `role` is the first-class agent/role label. Aggregation is limited to the most recent 30 days and groups by:
+OpenCode's session database is the first-class source for OpenCode agent attribution. The collector reads only `agent`, `model`, session count, timestamp, and token counter columns from the local `session` table. It never reads message/part payloads. Aggregation is limited to the most recent 30 days and groups by:
 
 ```text
-role + provider + model
+agent + provider + model
 ```
 
-Calls are counted from `attempt_started` events; token fields are summed from all valid events. This avoids requiring tokens to be attached to the start event while retaining one call per attempt. Distinct task IDs are counted for each group. Events without a role cannot be fabricated into an agent; they appear as “Sin identificar” only when the source explicitly provides an empty/unavailable role fallback.
+The database's session count is reported as calls and sessions. Its stored input/output/cache counters are copied without including cache in the billable quota numerator. If the database is unavailable, valid VibeBar events remain the fallback: calls come from `attempt_started`, tokens are summed from event token objects, and groups use `role + provider + model`.
 
-OpenCode model statistics remain the authoritative provider/model total. They are not merged into agent totals unless the event stream supplies role metadata, preventing double counting.
+OpenCode model statistics remain the authoritative provider/model total. Database agent rows are not merged with event rows for the same OpenCode agent/provider/model key, preventing double counting. Event rows for other providers remain visible.
 
 ## Backend/data contract changes
 
@@ -105,6 +106,7 @@ Extend the provider-neutral snapshot with:
 - A token-semantic helper or equivalent serialized fields for billable/cache totals.
 - Per-model quota windows where a model has more than one documented limit; each window can explicitly mark its percentage as unavailable when the local source does not provide the required time bucket.
 - `agentUsage`, containing role/agent label, provider, model, calls, distinct tasks, and token counters.
+- A bounded OpenCode database adapter that resolves the known local data paths and uses a read-only SQLite connection against the session aggregate columns only.
 
 Keep old telemetry rows readable. Any new serialized event field must be optional and backward-compatible, or use a versioned schema if the event contract needs a required semantic change. Existing validation, line limits, idempotency, and credential-scrubbed subprocess environments remain in force.
 
@@ -126,6 +128,7 @@ The Rust snapshot builder aggregates agent usage independently from provider col
 - Missing quotas render “sin cuota conocida” rather than an unlimited claim.
 - Missing reset timestamps render “reset desconocido”.
 - The app never stores or transmits credentials, prompts, responses, or source data.
+- The OpenCode agent collector never queries the `message` or `part` tables and never serializes transcript fields.
 - The popover and full dashboard use the same local snapshot and do not add a new network surface.
 
 ## Verification and acceptance criteria

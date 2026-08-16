@@ -25,6 +25,10 @@ This remains a personal-subscription trust boundary: the installed Codex binary 
 
 VibeBar launches `opencode stats --pure --days 30 --models` with fixed arguments. `--pure` disables external plugins for the collection run. The command receives the same credential-scrubbed environment, has a 25-second timeout, and has an 8 MiB combined-output ceiling. Its terminal output is parsed as untrusted, version-sensitive input; parse failure is visible and never triggers an alternate credential source.
 
+### Rust host → OpenCode local database
+
+VibeBar may open the user's local OpenCode SQLite database read-only to attribute usage to agents. The query selects only bounded aggregate columns from the `session` table (`agent`, `model`, timestamps, session count, and token counters) for the last 30 days. It never reads the `message`, `part`, `session_message`, prompt, response, or source-content tables, and it never copies the database or writes to it. Missing, locked, or schema-incompatible databases produce a visible diagnostic and the event telemetry fallback remains available.
+
 ### Local telemetry producer → JSONL store
 
 V1 assumes producers run as the same OS user. File tampering by that user can alter dashboard metrics. The reader bounds file and line sizes, validates every event, ignores duplicate IDs, and reports malformed rows. V1 is intentionally not suitable for cross-user, remote, or compliance-grade evidence.

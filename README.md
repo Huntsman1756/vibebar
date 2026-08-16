@@ -6,6 +6,7 @@ The current V1 reads:
 
 - ChatGPT/Codex subscription windows from the installed Codex App Server method `account/rateLimits/read`.
 - 30-day model traffic from the installed OpenCode CLI (`opencode stats --pure`), including NaN and any future provider visible to OpenCode.
+- 30-day agent/model usage from the local OpenCode session database when available; only aggregate session columns are read.
 - Outcome telemetry from VibeBar's bounded append-only JSONL contract.
 
 VibeBar does not read or copy `auth.json`, browser cookies, API keys, prompts, responses, source code, or terminal history. Collector subprocesses receive a credential-scrubbed environment and use fixed arguments with hard time and output limits.
@@ -43,6 +44,7 @@ The command prints the number of newly appended events. Replaying the same file 
 | --- | --- | --- |
 | Codex App Server | Used percentage and reset time for available subscription windows | Does not expose token totals for subscription work |
 | OpenCode stats | Calls and input/output/cache tokens by provider and model over 30 days | A rolling 30-day total is not necessarily the provider billing period |
+| OpenCode session database | Agent/model session counts and input/output/cache totals over 30 days | Only the local `session` aggregate columns are read; transcript tables are never queried |
 | VibeBar events | Attempts, acceptance, rejections, failures, escalations, duration, and optional cost | Requires the orchestrator to append the V1 events |
 
 ### Tray popover and usage semantics

@@ -10,10 +10,13 @@ use std::{
 
 use chrono::Utc;
 use regex::Regex;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 use wait_timeout::ChildExt;
 
-use crate::domain::{ModelQuota, ModelUsage, ProviderSnapshot, QuotaWindow, TokenUsage};
+use crate::domain::{
+    AgentUsage, ModelQuota, ModelUsage, ProviderSnapshot, QuotaWindow, TokenUsage,
+};
 
 const MAX_COLLECTOR_OUTPUT: u64 = 8 * 1024 * 1024;
 
@@ -360,6 +363,87 @@ pub fn collect_opencode() -> Result<Vec<ProviderSnapshot>, String> {
     parse_opencode_stats(&output)
 }
 
+fn opencode_database_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(xdg_data_home) = std::env::var_os("XDG_DATA_HOME") {
+        candidates.push(PathBuf::from(xdg_data_home).join("opencode/opencode.db"));
+    }
+    if let Some(data_dir) = dirs::data_dir() {
+        candidates.push(data_dir.join("opencode/opencode.db"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local/share/opencode/opencode.db"));
+        candidates.push(home.join("Library/Application Support/opencode/opencode.db"));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn opencode_model_identity(raw_model: &str) -> (String, String) {
+    if let Ok(value) = serde_json::from_str::<Value>(raw_model) {
+        let provider = value
+            .get("providerID")
+            .and_then(Value::as_str)
+            .unwrap_or("opencode");
+        let model = value.get("id").and_then(Value::as_str).unwrap_or(raw_model);
+        return (provider.to_lowercase(), model.to_string());
+    }
+    raw_model
+        .split_once('/')
+        .map(|(provider, model)| (provider.to_lowercase(), model.to_string()))
+        .unwrap_or_else(|| ("opencode".into(), raw_model.into()))
+}
+
+fn query_opencode_agent_usage(
+    connection: &Connection,
+    since_millis: i64,
+) -> Result<Vec<AgentUsage>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT COALESCE(agent, 'Sin identificar'), COALESCE(model, ''), COUNT(*), \
+             COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0), \
+             COALESCE(SUM(tokens_cache_read), 0), COALESCE(SUM(tokens_cache_write), 0) \
+             FROM session WHERE time_updated >= ?1 GROUP BY agent, model \
+             ORDER BY (COALESCE(SUM(tokens_input), 0) + COALESCE(SUM(tokens_output), 0)) DESC",
+        )
+        .map_err(|_| "OpenCode session table is unavailable".to_string())?;
+    let rows = statement
+        .query_map([since_millis], |row| {
+            let agent: String = row.get(0)?;
+            let raw_model: String = row.get(1)?;
+            let (provider, model) = opencode_model_identity(&raw_model);
+            let calls: i64 = row.get(2)?;
+            let input_tokens: i64 = row.get(3)?;
+            let output_tokens: i64 = row.get(4)?;
+            let cache_read_tokens: i64 = row.get(5)?;
+            let cache_write_tokens: i64 = row.get(6)?;
+            Ok(AgentUsage {
+                agent,
+                provider,
+                model,
+                source: "opencode-db-30d".into(),
+                calls: calls.max(0) as u64,
+                tasks: calls.max(0) as u64,
+                tokens: TokenUsage {
+                    input_tokens: input_tokens.max(0) as u64,
+                    output_tokens: output_tokens.max(0) as u64,
+                    cache_read_tokens: cache_read_tokens.max(0) as u64,
+                    cache_write_tokens: cache_write_tokens.max(0) as u64,
+                },
+            })
+        })
+        .map_err(|_| "OpenCode session usage query failed".to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "OpenCode session usage row was invalid".to_string())
+}
+
+pub fn collect_opencode_agent_usage() -> Result<Vec<AgentUsage>, String> {
+    let path = opencode_database_path().ok_or("OpenCode session database is unavailable")?;
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "OpenCode session database cannot be opened read-only")?;
+    let since_millis = (Utc::now() - chrono::Duration::days(30)).timestamp_millis();
+    query_opencode_agent_usage(&connection, since_millis)
+}
+
 fn parse_window(label: &str, value: Option<&Value>) -> Option<QuotaWindow> {
     let value = value?;
     Some(QuotaWindow {
@@ -681,5 +765,38 @@ done
         assert!(windows[0].used_percent.is_some());
         assert!(windows[1].used_percent.is_none());
         assert_eq!(windows[1].duration_minutes, Some(240));
+    }
+
+    #[test]
+    fn reads_opencode_agent_tokens_from_session_aggregate() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE session (
+                    agent TEXT,
+                    model TEXT,
+                    time_updated INTEGER,
+                    tokens_input INTEGER,
+                    tokens_output INTEGER,
+                    tokens_cache_read INTEGER,
+                    tokens_cache_write INTEGER
+                );
+                INSERT INTO session VALUES
+                    ('executor', '{"id":"qwen3.6","providerID":"nan","variant":"default"}', 2000, 100, 25, 500, 3),
+                    ('executor', '{"id":"qwen3.6","providerID":"nan","variant":"default"}', 3000, 20, 5, 10, 0),
+                    ('old-agent', '{"id":"mimo-v2.5","providerID":"nan"}', 999, 900, 900, 900, 900);
+                "#,
+            )
+            .unwrap();
+
+        let usage = query_opencode_agent_usage(&connection, 1000).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].agent, "executor");
+        assert_eq!(usage[0].provider, "nan");
+        assert_eq!(usage[0].model, "qwen3.6");
+        assert_eq!(usage[0].calls, 2);
+        assert_eq!(usage[0].tokens.billable(), 150);
+        assert_eq!(usage[0].tokens.cache(), 513);
     }
 }

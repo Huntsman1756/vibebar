@@ -162,6 +162,7 @@ pub struct AgentUsage {
     pub agent: String,
     pub provider: String,
     pub model: String,
+    pub source: String,
     pub calls: u64,
     pub tasks: u64,
     pub tokens: TokenUsage,
@@ -236,6 +237,7 @@ pub fn aggregate_agent_usage(events: &[UsageEvent], since: DateTime<Utc>) -> Vec
                     agent: event.role.clone(),
                     provider: event.provider.clone(),
                     model: event.model.clone(),
+                    source: "vibebar-events-30d".into(),
                     calls: 0,
                     tasks: 0,
                     tokens: TokenUsage {
@@ -294,6 +296,38 @@ pub fn aggregate_agent_usage(events: &[UsageEvent], since: DateTime<Utc>) -> Vec
             .then_with(|| left.model.cmp(&right.model))
     });
     usage
+}
+
+pub fn merge_agent_usage(primary: Vec<AgentUsage>, fallback: Vec<AgentUsage>) -> Vec<AgentUsage> {
+    let primary_keys = primary
+        .iter()
+        .map(|item| {
+            (
+                item.agent.clone(),
+                item.provider.clone(),
+                item.model.clone(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    let mut merged = primary;
+    merged.extend(fallback.into_iter().filter(|item| {
+        !primary_keys.contains(&(
+            item.agent.clone(),
+            item.provider.clone(),
+            item.model.clone(),
+        ))
+    }));
+    merged.sort_by(|left, right| {
+        right
+            .tokens
+            .billable()
+            .cmp(&left.tokens.billable())
+            .then_with(|| right.calls.cmp(&left.calls))
+            .then_with(|| left.agent.cmp(&right.agent))
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.model.cmp(&right.model))
+    });
+    merged
 }
 
 pub fn validate_batch(events: &[UsageEvent]) -> Result<(), String> {
@@ -438,6 +472,67 @@ mod tests {
         )];
 
         assert!(aggregate_agent_usage(&events, since).is_empty());
+    }
+
+    #[test]
+    fn primary_opencode_agent_rows_replace_duplicate_event_rows() {
+        let primary = vec![AgentUsage {
+            agent: "executor".into(),
+            provider: "nan".into(),
+            model: "qwen3.6".into(),
+            source: "opencode-db-30d".into(),
+            calls: 2,
+            tasks: 2,
+            tokens: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        }];
+        let fallback = vec![
+            AgentUsage {
+                agent: "executor".into(),
+                provider: "nan".into(),
+                model: "qwen3.6".into(),
+                source: "vibebar-events-30d".into(),
+                calls: 99,
+                tasks: 99,
+                tokens: TokenUsage {
+                    input_tokens: 900,
+                    output_tokens: 90,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+            },
+            AgentUsage {
+                agent: "reviewer".into(),
+                provider: "chatgpt".into(),
+                model: "codex".into(),
+                source: "vibebar-events-30d".into(),
+                calls: 1,
+                tasks: 1,
+                tokens: TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 4,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+            },
+        ];
+
+        let merged = merge_agent_usage(primary, fallback);
+        assert_eq!(merged.len(), 2);
+        let executor = merged.iter().find(|item| item.agent == "executor").unwrap();
+        assert_eq!(executor.tokens.billable(), 110);
+        assert_eq!(
+            merged
+                .iter()
+                .find(|item| item.agent == "reviewer")
+                .unwrap()
+                .source,
+            "vibebar-events-30d"
+        );
     }
 
     #[test]

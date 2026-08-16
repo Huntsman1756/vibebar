@@ -35,6 +35,8 @@
 - Modify `src/App.css`: style the popover and new usage/agent sections without changing the existing dark visual language.
 - Modify `README.md`: document the popover, agent attribution, quota semantics, and known period limitation.
 
+OpenCode agent attribution is implemented as a read-only SQLite adapter in `src-tauri/src/collectors.rs`; it queries only the `session` aggregate columns and falls back to VibeBar events when the database is unavailable.
+
 ## Task 1: Add tested token semantics and agent aggregation
 
 **Files:**
@@ -531,3 +533,7 @@ rtk gh pr create --draft --base main --head agent/usage-dashboard --title "feat:
 ```
 
 The PR body must summarize the compact popover, quota semantics, agent aggregation, privacy boundary, and exact verification commands. Confirm the pushed branch and draft PR URL to the user; do not push directly to `main`.
+
+## Addendum: Direct OpenCode agent source discovered during verification
+
+The local OpenCode installation exposes an `opencode.db` session table with agent/model and token counters. Before final verification, add `rusqlite` with the `bundled` feature and implement a read-only `query_opencode_agent_usage` adapter. Test it against an in-memory session-shaped table, resolve `~/.local/share/opencode/opencode.db` plus platform data paths, merge database rows ahead of event rows for matching OpenCode keys, and label the source as `opencode-db-30d`. Do not read message/part payloads. Re-run the full automated checks and document the database source in the README and threat model.
