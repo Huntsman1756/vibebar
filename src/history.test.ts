@@ -3,8 +3,11 @@ import type { UsageHistoryRow } from "./types";
 import {
   aggregateHistoryByAgent,
   aggregateHistoryByProvider,
+  aggregateHistoryByProviderTotals,
   aggregateHistoryByRepository,
+  buildProviderToneMap,
   historyStart,
+  sanitizeRepositoryIdentifier,
   selectHistoryRows,
 } from "./history";
 
@@ -189,6 +192,30 @@ describe("aggregateHistoryByProvider", () => {
   });
 });
 
+describe("aggregateHistoryByProviderTotals", () => {
+  it("collapses multiple models into provider totals and keeps tie ordering deterministic", () => {
+    const summaries = aggregateHistoryByProviderTotals(selectHistoryRows(rows, "30d", "2026-08-16"));
+
+    expect(summaries.map((summary) => `${summary.provider}:${summary.billableTokens}:${summary.models.join(",")}`)).toEqual([
+      "nan:450:deepseek-v4-flash,qwen3.6",
+      "aaa-provider:100:model-a",
+      "bbb-provider:100:model-a",
+      "opencode-go:100:qwen3.6",
+    ]);
+  });
+
+  it("builds a stable provider tone map from selected-period totals", () => {
+    const tones = buildProviderToneMap(aggregateHistoryByProviderTotals(selectHistoryRows(rows, "30d", "2026-08-16")), ["mint", "violet", "amber", "slate"]);
+
+    expect([...tones.entries()]).toEqual([
+      ["nan", "mint"],
+      ["aaa-provider", "violet"],
+      ["bbb-provider", "amber"],
+      ["opencode-go", "slate"],
+    ]);
+  });
+});
+
 describe("aggregateHistoryByRepository", () => {
   it("groups repository totals without mixing billable and cache tokens", () => {
     const summaries = aggregateHistoryByRepository(selectHistoryRows(rows, "30d", "2026-08-16"));
@@ -204,6 +231,24 @@ describe("aggregateHistoryByRepository", () => {
       providers: ["nan"],
       sourceFidelities: ["metadata"],
     });
+  });
+});
+
+describe("sanitizeRepositoryIdentifier", () => {
+  it("keeps only normalized repository identifiers and falls back for unsafe values", () => {
+    expect(sanitizeRepositoryIdentifier("Repository attribution disabled")).toBe("Repository attribution disabled");
+    expect(sanitizeRepositoryIdentifier("local/demo-project")).toBe("local/demo-project");
+    expect(sanitizeRepositoryIdentifier("github.com/acme/repo")).toBe("github.com/acme/repo");
+    expect(sanitizeRepositoryIdentifier("gitlab.example/team/tooling/service")).toBe("gitlab.example/team/tooling/service");
+
+    expect(sanitizeRepositoryIdentifier("")).toBe("local/unknown");
+    expect(sanitizeRepositoryIdentifier("/tmp/private")).toBe("local/unknown");
+    expect(sanitizeRepositoryIdentifier("C:\\repo")).toBe("local/unknown");
+    expect(sanitizeRepositoryIdentifier("local/nested/path")).toBe("local/unknown");
+    expect(sanitizeRepositoryIdentifier("github.com/acme/../repo")).toBe("local/unknown");
+    expect(sanitizeRepositoryIdentifier("github.com/acme/repo!")).toBe("local/unknown");
+    expect(sanitizeRepositoryIdentifier("github.com/acme\\repo")).toBe("local/unknown");
+    expect(sanitizeRepositoryIdentifier("github.com//repo")).toBe("local/unknown");
   });
 });
 

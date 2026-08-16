@@ -3,6 +3,7 @@ import type {
   HistoryRange,
   HistorySourceFidelity,
   ProviderHistorySummary,
+  ProviderTotalHistorySummary,
   RepositoryHistorySummary,
   UsageHistoryRow,
 } from "./types";
@@ -23,6 +24,8 @@ type AggregateBucket = {
 };
 
 const datePattern = /^(\d{4})-(\d{2})-(\d{2})$/;
+const safeHostPattern = /^[A-Za-z0-9.-]+$/;
+const safeSegmentPattern = /^[A-Za-z0-9._-]+$/;
 const fidelityOrder: Record<HistorySourceFidelity, number> = {
   metadata: 0,
   "event-fallback": 1,
@@ -118,6 +121,18 @@ function summarizeBucket(bucket: AggregateBucket) {
   };
 }
 
+function isUnsafeRepositoryValue(value: string) {
+  return value.length === 0
+    || /[\u0000-\u001F\u007F]/.test(value)
+    || value.includes("\\")
+    || value.startsWith("/")
+    || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+function isSafeSegment(value: string) {
+  return value.length > 0 && value !== "." && value !== ".." && safeSegmentPattern.test(value);
+}
+
 export function historyStart(range: HistoryRange, today: string): string {
   switch (range) {
     case "today":
@@ -161,6 +176,32 @@ export function aggregateHistoryByProvider(rows: UsageHistoryRow[]): ProviderHis
       || compareText(left.model, right.model));
 }
 
+export function aggregateHistoryByProviderTotals(rows: UsageHistoryRow[]): ProviderTotalHistorySummary[] {
+  const buckets = new Map<string, AggregateBucket>();
+
+  for (const row of rows) {
+    const bucket = buckets.get(row.provider) ?? createBucket();
+    addRow(bucket, row);
+    buckets.set(row.provider, bucket);
+  }
+
+  return [...buckets.entries()]
+    .map(([provider, bucket]) => ({
+      provider,
+      models: [...bucket.models].sort(compareText),
+      ...summarizeBucket(bucket),
+    }))
+    .sort((left, right) => right.billableTokens - left.billableTokens
+      || compareText(left.provider, right.provider));
+}
+
+export function buildProviderToneMap(
+  summaries: ProviderTotalHistorySummary[],
+  tones: readonly string[],
+): Map<string, string> {
+  return new Map(summaries.map((summary, index) => [summary.provider, tones[index % tones.length] ?? tones[0] ?? "mint"]));
+}
+
 export function aggregateHistoryByRepository(rows: UsageHistoryRow[]): RepositoryHistorySummary[] {
   const buckets = new Map<string, AggregateBucket>();
 
@@ -201,4 +242,30 @@ export function aggregateHistoryByAgent(rows: UsageHistoryRow[]): AgentHistorySu
       || compareText(left.provider, right.provider)
       || compareText(left.model, right.model)
       || compareText(left.repository, right.repository));
+}
+
+export function sanitizeRepositoryIdentifier(repository: string): string {
+  if (repository === "Repository attribution disabled") {
+    return repository;
+  }
+
+  if (isUnsafeRepositoryValue(repository)) {
+    return "local/unknown";
+  }
+
+  const segments = repository.split("/");
+  if (segments.length < 2 || segments.some((segment) => segment.length === 0)) {
+    return "local/unknown";
+  }
+
+  if (segments[0] === "local") {
+    return segments.length === 2 && isSafeSegment(segments[1]) ? repository : "local/unknown";
+  }
+
+  const [host, ...pathSegments] = segments;
+  if (!safeHostPattern.test(host) || host.startsWith(".") || host.endsWith(".") || host.startsWith("-") || host.endsWith("-")) {
+    return "local/unknown";
+  }
+
+  return pathSegments.length > 0 && pathSegments.every(isSafeSegment) ? repository : "local/unknown";
 }

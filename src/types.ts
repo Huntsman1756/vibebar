@@ -21,6 +21,7 @@ export type HistorySummary = {
   sources: string[];
   sourceFidelities: HistorySourceFidelity[];
 };
+export type ProviderTotalHistorySummary = HistorySummary & { provider: string; models: string[] };
 export type ProviderHistorySummary = HistorySummary & { provider: string; model: string };
 export type RepositoryHistorySummary = HistorySummary & { repository: string; providers: string[]; models: string[] };
 export type AgentHistorySummary = HistorySummary & { agent: string; provider: string; model: string; repository: string };

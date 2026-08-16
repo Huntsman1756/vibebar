@@ -92,3 +92,71 @@ $ rtk git diff --check
 ## Concerns
 
 - The new frontend tests cover the pure selector contract only. There is no browser-level UI test yet for period switching, the chart, or the popover summary layout, so those behaviors are currently verified through the production build plus manual code inspection rather than automated DOM assertions.
+
+## Round 1 Fix
+
+Date: August 16, 2026
+Parent commit: `7c44d8ff28b4cbd6b7aa53b903a74a87da38024e`
+
+### Scope
+
+- Replaced provider+model legend and compact top-provider summaries with provider-only aggregation.
+- Added stable provider tone assignment derived from selected-period provider totals, then reused that map for every day in the stacked chart.
+- Switched history period controls from incomplete tab semantics to an ordinary labelled button group with `aria-pressed`.
+- Hardened repository rendering with a whitelist sanitizer that only allows normalized repository identifiers and falls back to `local/unknown` for unsafe strings.
+- Added focused regression coverage for provider-only aggregation, tone ordering, and repository sanitization.
+
+### RED Evidence
+
+Focused frontend test run before the new helpers existed:
+
+```text
+$ rtk npm run test:frontend
+> vitest run
+ RUN  v3.2.7 /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar
+ ❯ src/history.test.ts (9 tests | 3 failed) 12ms
+   × aggregateHistoryByProviderTotals > collapses multiple models into provider totals and keeps tie ordering deterministic
+     → (0 , aggregateHistoryByProviderTotals) is not a function
+   × aggregateHistoryByProviderTotals > builds a stable provider tone map from selected-period totals
+     → (0 , aggregateHistoryByProviderTotals) is not a function
+   × sanitizeRepositoryIdentifier > keeps only normalized repository identifiers and falls back for unsafe values
+     → (0 , sanitizeRepositoryIdentifier) is not a function
+```
+
+### GREEN Evidence
+
+Focused frontend selector suite on the final fix tree:
+
+```text
+$ rtk npm run test:frontend
+> vitest run
+ RUN  v3.2.7 /Users/dani/Documents/Codex/2026-08-16/he-c/work/vibebar
+ ✓ src/history.test.ts (9 tests) 19ms
+ Test Files  1 passed (1)
+      Tests  9 passed (9)
+   Start at  19:02:09
+   Duration  564ms (transform 60ms, setup 0ms, collect 56ms, tests 19ms, environment 0ms, prepare 89ms)
+```
+
+Production build on the final fix tree:
+
+```text
+$ rtk npm run build
+> tsc && vite build
+vite v7.3.6 building client environment for production...
+transforming...
+✓ 33 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                   0.55 kB │ gzip:  0.34 kB
+dist/assets/index-DKk3YSOT.css   22.05 kB │ gzip:  5.27 kB
+dist/assets/index-D-PrBVpN.js   233.01 kB │ gzip: 70.25 kB
+✓ built in 468ms
+```
+
+Diff hygiene:
+
+```text
+$ rtk git diff --check
+[no output]
+```

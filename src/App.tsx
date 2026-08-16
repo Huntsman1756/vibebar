@@ -5,7 +5,10 @@ import { demoSnapshot } from "./demo";
 import {
   aggregateHistoryByAgent,
   aggregateHistoryByProvider,
+  aggregateHistoryByProviderTotals,
   aggregateHistoryByRepository,
+  buildProviderToneMap,
+  sanitizeRepositoryIdentifier,
   selectHistoryRows,
 } from "./history";
 import type {
@@ -16,6 +19,7 @@ import type {
   ModelQuota,
   ModelUsage,
   ProviderHistorySummary,
+  ProviderTotalHistorySummary,
   ProviderSnapshot,
   QuotaWindow,
   RepositoryHistorySummary,
@@ -75,10 +79,7 @@ function providerLabel(provider: string, labels: Map<string, string>) {
 }
 
 function repositoryLabel(repository: string) {
-  if (!repository) return "local/unknown";
-  if (repository === "Repository attribution disabled") return repository;
-  if (repository.startsWith("/") || /^[A-Za-z]:[\\/]/.test(repository)) return "local/unknown";
-  return repository;
+  return sanitizeRepositoryIdentifier(repository);
 }
 
 function sourceFidelityLabel(value: HistorySourceFidelity) {
@@ -111,7 +112,11 @@ function summarizeHistoryRows(rows: UsageHistoryRow[]) {
   }, { billableTokens: 0, cacheTokens: 0, messages: 0, sessions: 0, costMicrousd: null as number | null });
 }
 
-function buildDailyProviderSeries(rows: UsageHistoryRow[], labels: Map<string, string>) {
+function buildDailyProviderSeries(
+  rows: UsageHistoryRow[],
+  labels: Map<string, string>,
+  providerOrder: Map<string, number>,
+) {
   const days = new Map<string, Map<string, number>>();
 
   for (const row of rows) {
@@ -126,7 +131,10 @@ function buildDailyProviderSeries(rows: UsageHistoryRow[], labels: Map<string, s
     .map(([day, providers]) => {
       const series = [...providers.entries()]
         .map(([provider, total]) => ({ provider, label: providerLabel(provider, labels), total }))
-        .sort((left, right) => right.total - left.total || left.provider.localeCompare(right.provider, "en"));
+        .sort((left, right) =>
+          (providerOrder.get(left.provider) ?? Number.MAX_SAFE_INTEGER) - (providerOrder.get(right.provider) ?? Number.MAX_SAFE_INTEGER)
+          || right.total - left.total
+          || left.provider.localeCompare(right.provider, "en"));
       return {
         day,
         total: series.reduce((sum, item) => sum + item.total, 0),
@@ -199,8 +207,8 @@ function CompactProviderCard({ provider }: { provider: ProviderSnapshot }) {
 }
 
 function HistoryRangeButtons({ value, onChange, compact: isCompact = false }: { value: HistoryRange; onChange: (value: HistoryRange) => void; compact?: boolean }) {
-  return <div className={`history-range-group ${isCompact ? "compact" : ""}`} role="tablist" aria-label="Historical usage period">
-    {historyRanges.map((range) => <button key={range.value} type="button" role="tab" aria-selected={range.value === value} className={range.value === value ? "is-active" : ""} onClick={() => onChange(range.value)}>{range.label}</button>)}
+  return <div className={`history-range-group ${isCompact ? "compact" : ""}`} role="group" aria-label="Historical usage period">
+    {historyRanges.map((range) => <button key={range.value} type="button" aria-pressed={range.value === value} className={range.value === value ? "is-active" : ""} onClick={() => onChange(range.value)}>{range.label}</button>)}
   </div>;
 }
 
@@ -215,9 +223,15 @@ function HistoryState({ title, copy }: { title: string; copy: string }) {
   return <div className="empty history-empty"><span>⌁</span><strong>{title}</strong><p>{copy}</p></div>;
 }
 
-function HistoryChart({ rows, providerLabels }: { rows: UsageHistoryRow[]; providerLabels: Map<string, string> }) {
-  const series = useMemo(() => buildDailyProviderSeries(rows, providerLabels), [providerLabels, rows]);
-  const legend = useMemo(() => aggregateHistoryByProvider(rows).slice(0, 4), [rows]);
+function HistoryChart({ rows, providerLabels, providerTotals, providerTones }: {
+  rows: UsageHistoryRow[];
+  providerLabels: Map<string, string>;
+  providerTotals: ProviderTotalHistorySummary[];
+  providerTones: Map<string, string>;
+}) {
+  const providerOrder = useMemo(() => new Map(providerTotals.map((provider, index) => [provider.provider, index])), [providerTotals]);
+  const series = useMemo(() => buildDailyProviderSeries(rows, providerLabels, providerOrder), [providerLabels, providerOrder, rows]);
+  const legend = useMemo(() => providerTotals.slice(0, 4), [providerTotals]);
   const maxTotal = useMemo(() => Math.max(...series.map((item) => item.total), 1), [series]);
 
   if (series.length === 0) {
@@ -237,7 +251,7 @@ function HistoryChart({ rows, providerLabels }: { rows: UsageHistoryRow[]; provi
           <div className="history-day-bars" role="img" aria-label={aria}>
             <div className="history-day-rail">
               <div className="history-day-stack" style={{ width: `${(day.total / maxTotal) * 100}%` }}>
-                {day.providers.map((provider, index) => <span key={`${day.day}-${provider.provider}`} className={`history-day-segment tone-${historyBarTones[index % historyBarTones.length]}`} style={{ width: `${day.total === 0 ? 0 : (provider.total / day.total) * 100}%` }} title={`${provider.label}: ${formatTokens(provider.total)}`} />)}
+                {day.providers.map((provider) => <span key={`${day.day}-${provider.provider}`} className={`history-day-segment tone-${providerTones.get(provider.provider) ?? historyBarTones[0]}`} style={{ width: `${day.total === 0 ? 0 : (provider.total / day.total) * 100}%` }} title={`${provider.label}: ${formatTokens(provider.total)}`} />)}
               </div>
             </div>
           </div>
@@ -245,7 +259,7 @@ function HistoryChart({ rows, providerLabels }: { rows: UsageHistoryRow[]; provi
       })}
     </ol>
     <div className="history-legend">
-      {legend.map((provider, index) => <div key={`${provider.provider}-${provider.model}`} className="history-legend-item"><span className={`history-dot tone-${historyBarTones[index % historyBarTones.length]}`} />{providerLabel(provider.provider, providerLabels)}</div>)}
+      {legend.map((provider) => <div key={provider.provider} className="history-legend-item"><span className={`history-dot tone-${providerTones.get(provider.provider) ?? historyBarTones[0]}`} />{providerLabel(provider.provider, providerLabels)}</div>)}
     </div>
   </>;
 }
@@ -320,6 +334,8 @@ function HistoryPanel({ snapshot, providerLabels, range, onRangeChange }: { snap
   const rows = useMemo(() => history ? selectHistoryRows(history.rows, range, localToday) : [], [history, localToday, range]);
   const totals = useMemo(() => summarizeHistoryRows(rows), [rows]);
   const providers = useMemo(() => aggregateHistoryByProvider(rows), [rows]);
+  const providerTotals = useMemo(() => aggregateHistoryByProviderTotals(rows), [rows]);
+  const providerTones = useMemo(() => buildProviderToneMap(providerTotals, historyBarTones), [providerTotals]);
   const repositories = useMemo(() => aggregateHistoryByRepository(rows), [rows]);
   const agents = useMemo(() => aggregateHistoryByAgent(rows), [rows]);
   const hasSessionFallback = useMemo(() => rows.some((row) => row.sourceFidelity === "session-fallback"), [rows]);
@@ -344,7 +360,7 @@ function HistoryPanel({ snapshot, providerLabels, range, onRangeChange }: { snap
         {totals.costMicrousd != null ? <div className="history-summary-card"><span>Observed cost</span><strong>{formatObservedCost(totals.costMicrousd)}</strong><small>Only when the source provides cost</small></div> : null}
       </div>
       <article className="history-chart-card">
-        <HistoryChart rows={rows} providerLabels={providerLabels} />
+        <HistoryChart rows={rows} providerLabels={providerLabels} providerTotals={providerTotals} providerTones={providerTones} />
       </article>
       <div className="history-table-grid">
         <ProviderHistoryTable summaries={providers} providerLabels={providerLabels} />
@@ -360,7 +376,7 @@ function CompactHistorySummary({ snapshot, providerLabels, range, onRangeChange 
   const localToday = useMemo(() => toLocalIsoDay(snapshot ? new Date(snapshot.generatedAt) : new Date()), [snapshot]);
   const rows = useMemo(() => history ? selectHistoryRows(history.rows, range, localToday) : [], [history, localToday, range]);
   const totals = useMemo(() => summarizeHistoryRows(rows), [rows]);
-  const providers = useMemo(() => aggregateHistoryByProvider(rows).slice(0, 3), [rows]);
+  const providers = useMemo(() => aggregateHistoryByProviderTotals(rows).slice(0, 3), [rows]);
   const repositories = useMemo(() => aggregateHistoryByRepository(rows).slice(0, 3), [rows]);
   const hasSessionFallback = rows.some((row) => row.sourceFidelity === "session-fallback");
   const unavailable = Boolean(history && history.rows.length === 0 && !history.oldestDay && !history.newestDay);
@@ -373,7 +389,7 @@ function CompactHistorySummary({ snapshot, providerLabels, range, onRangeChange 
       <div className="compact-history-total"><strong>{formatTokens(totals.billableTokens)}</strong><span>{formatTokens(totals.cacheTokens)} cache · {compact.format(totals.messages)} msgs · {compact.format(totals.sessions)} sessions</span></div>
       <div className="compact-mini-group">
         <div className="compact-mini-head"><span>Top providers</span><small>{providers.length} shown</small></div>
-        <div className="compact-mini-list">{providers.map((provider) => <div className="compact-mini-row" key={`${provider.provider}-${provider.model}`}><strong>{providerLabel(provider.provider, providerLabels)}</strong><small>{provider.model}</small><span>{formatTokens(provider.billableTokens)}</span></div>)}</div>
+        <div className="compact-mini-list">{providers.map((provider) => <div className="compact-mini-row" key={provider.provider}><strong>{providerLabel(provider.provider, providerLabels)}</strong><small>{provider.models.join(" · ")}</small><span>{formatTokens(provider.billableTokens)}</span></div>)}</div>
       </div>
       <div className="compact-mini-group">
         <div className="compact-mini-head"><span>Top repositories</span><small>{repositories.length} shown</small></div>
