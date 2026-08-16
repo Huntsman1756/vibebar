@@ -218,7 +218,7 @@ pub fn parse_opencode_stats(output: &str) -> Result<Vec<ProviderSnapshot>, Strin
         }
     }
     for ((provider, model), usage) in &mut usages {
-        usage.quota_windows = quota_windows_for(provider, model, usage.tokens.billable());
+        usage.quota_windows = allowance_windows_for(provider, model);
     }
     if usages.is_empty() {
         return Err("OpenCode returned no model usage".into());
@@ -231,7 +231,7 @@ pub fn parse_opencode_stats(output: &str) -> Result<Vec<ProviderSnapshot>, Strin
     Ok(grouped
         .into_iter()
         .map(|(provider, mut models)| {
-            models.sort_by_key(|model| std::cmp::Reverse(model.tokens.billable()));
+            models.sort_by_key(|model| std::cmp::Reverse(model.tokens.primary()));
             let calls = models.iter().map(|model| model.calls).sum();
             let tokens = sum_tokens(models.iter().map(|model| &model.tokens));
             ProviderSnapshot {
@@ -275,38 +275,36 @@ fn quota_label_for(provider: &str, model: &str) -> Option<String> {
     }
 }
 
-pub fn quota_windows_for(provider: &str, model: &str, billable_tokens: u64) -> Vec<ModelQuota> {
-    let monthly_window = |label: &str, quota_tokens: u64, period_label: &str| {
-        let used_percent = billable_tokens as f64 / quota_tokens as f64 * 100.0;
-        ModelQuota {
+pub fn allowance_windows_for(provider: &str, model: &str) -> Vec<ModelQuota> {
+    let published_unmetered_window =
+        |label: &str, quota_tokens: u64, period_label: &str| ModelQuota {
             label: label.into(),
             quota_tokens,
-            used_percent: Some(used_percent),
-            remaining_percent: Some((100.0 - used_percent).max(0.0)),
+            used_percent: None,
+            remaining_percent: None,
             resets_at: None,
             duration_minutes: None,
             period_label: period_label.into(),
-        }
-    };
+        };
     match (
         provider.to_ascii_lowercase().as_str(),
         model.to_ascii_lowercase().as_str(),
     ) {
-        ("nan", "deepseek-v4-flash") => vec![monthly_window(
+        ("nan", "deepseek-v4-flash") => vec![published_unmetered_window(
             "Monthly",
             500_000_000,
-            "30-day observed / published monthly allowance",
+            "Published monthly allowance; local 30-day source cannot meter this window",
         )],
-        ("nan", "mimo-v2.5") => vec![monthly_window(
+        ("nan", "mimo-v2.5") => vec![published_unmetered_window(
             "Monthly",
             1_000_000_000,
-            "30-day observed / published monthly allowance",
+            "Published monthly allowance; local 30-day source cannot meter this window",
         )],
         ("nan", "glm5.2") => vec![
-            monthly_window(
+            published_unmetered_window(
                 "Billing period",
                 3_000_000_000,
-                "30-day observed / published billing-period allowance",
+                "Published billing-period allowance; local 30-day source cannot meter this window",
             ),
             ModelQuota {
                 label: "Rolling 4h".into(),
@@ -321,6 +319,10 @@ pub fn quota_windows_for(provider: &str, model: &str, billable_tokens: u64) -> V
         ],
         _ => Vec::new(),
     }
+}
+
+pub fn quota_windows_for(provider: &str, model: &str, _primary_tokens: u64) -> Vec<ModelQuota> {
+    allowance_windows_for(provider, model)
 }
 
 fn sum_tokens<'a>(tokens: impl Iterator<Item = &'a TokenUsage>) -> TokenUsage {
@@ -705,27 +707,37 @@ done
     }
 
     #[test]
-    fn nan_quota_windows_use_billable_tokens_only() {
-        let windows = quota_windows_for("nan", "deepseek-v4-flash", 25_000_000);
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].quota_tokens, 500_000_000);
-        assert_eq!(windows[0].used_percent, Some(5.0));
-        assert_eq!(windows[0].remaining_percent, Some(95.0));
+    fn nan_allowance_windows_remain_present_but_unmetered() {
+        let deepseek = allowance_windows_for("nan", "deepseek-v4-flash");
+        assert_eq!(deepseek.len(), 1);
+        assert_eq!(deepseek[0].label, "Monthly");
+        assert_eq!(deepseek[0].quota_tokens, 500_000_000);
+        assert_eq!(deepseek[0].used_percent, None);
+        assert_eq!(deepseek[0].remaining_percent, None);
+
+        let mimo = allowance_windows_for("nan", "mimo-v2.5");
+        assert_eq!(mimo.len(), 1);
+        assert_eq!(mimo[0].label, "Monthly");
+        assert_eq!(mimo[0].quota_tokens, 1_000_000_000);
+        assert_eq!(mimo[0].used_percent, None);
+        assert_eq!(mimo[0].remaining_percent, None);
+
+        let glm = allowance_windows_for("nan", "glm5.2");
+        assert_eq!(glm.len(), 2);
+        assert_eq!(glm[0].label, "Billing period");
+        assert_eq!(glm[0].quota_tokens, 3_000_000_000);
+        assert_eq!(glm[0].used_percent, None);
+        assert_eq!(glm[0].remaining_percent, None);
+        assert_eq!(glm[1].label, "Rolling 4h");
+        assert_eq!(glm[1].quota_tokens, 400_000_000);
+        assert_eq!(glm[1].used_percent, None);
+        assert_eq!(glm[1].remaining_percent, None);
     }
 
     #[test]
     fn nan_models_without_published_quota_have_no_quota_windows() {
-        assert!(quota_windows_for("nan", "qwen3.6", 123).is_empty());
-    }
-
-    #[test]
-    fn glm5_has_monthly_window_and_unmetered_four_hour_window() {
-        let windows = quota_windows_for("nan", "glm5.2", 30_000_000);
-        assert_eq!(windows.len(), 2);
-        assert_eq!(windows[0].quota_tokens, 3_000_000_000);
-        assert!(windows[0].used_percent.is_some());
-        assert!(windows[1].used_percent.is_none());
-        assert_eq!(windows[1].duration_minutes, Some(240));
+        assert!(allowance_windows_for("nan", "qwen3.6").is_empty());
+        assert!(allowance_windows_for("nan", "gemma4").is_empty());
     }
 
     #[test]

@@ -21,8 +21,12 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    pub fn billable(&self) -> u64 {
+    pub fn primary(&self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    pub fn billable(&self) -> u64 {
+        self.primary()
     }
 
     pub fn cache(&self) -> u64 {
@@ -34,10 +38,14 @@ impl TokenUsage {
         self.reasoning_tokens
     }
 
-    pub fn total(&self) -> u64 {
-        self.billable()
+    pub fn observed_total(&self) -> u64 {
+        self.primary()
             .saturating_add(self.reasoning())
             .saturating_add(self.cache())
+    }
+
+    pub fn total(&self) -> u64 {
+        self.observed_total()
     }
 }
 
@@ -355,8 +363,8 @@ pub fn aggregate_agent_usage(events: &[UsageEvent], since: DateTime<Utc>) -> Vec
     usage.sort_by(|left, right| {
         right
             .tokens
-            .billable()
-            .cmp(&left.tokens.billable())
+            .primary()
+            .cmp(&left.tokens.primary())
             .then_with(|| right.calls.cmp(&left.calls))
             .then_with(|| left.agent.cmp(&right.agent))
             .then_with(|| left.provider.cmp(&right.provider))
@@ -387,8 +395,8 @@ pub fn merge_agent_usage(primary: Vec<AgentUsage>, fallback: Vec<AgentUsage>) ->
     merged.sort_by(|left, right| {
         right
             .tokens
-            .billable()
-            .cmp(&left.tokens.billable())
+            .primary()
+            .cmp(&left.tokens.primary())
             .then_with(|| right.calls.cmp(&left.calls))
             .then_with(|| left.agent.cmp(&right.agent))
             .then_with(|| left.provider.cmp(&right.provider))
@@ -477,8 +485,8 @@ pub fn aggregate_history_rows(rows: impl IntoIterator<Item = UsageHistoryRow>) -
     rows.sort_by(|left, right| {
         right
             .tokens
-            .billable()
-            .cmp(&left.tokens.billable())
+            .primary()
+            .cmp(&left.tokens.primary())
             .then_with(|| left.day.cmp(&right.day))
             .then_with(|| left.provider.cmp(&right.provider))
             .then_with(|| left.model.cmp(&right.model))
@@ -604,18 +612,33 @@ mod tests {
     }
 
     #[test]
-    fn billable_tokens_exclude_cache_tokens() {
+    fn token_usage_exposes_primary_reasoning_cache_and_observed_totals() {
         let usage = TokenUsage {
-            input_tokens: 12,
-            output_tokens: 8,
-            reasoning_tokens: 0,
-            cache_read_tokens: 900,
-            cache_write_tokens: 50,
+            input_tokens: 11,
+            output_tokens: 7,
+            reasoning_tokens: 5,
+            cache_read_tokens: 13,
+            cache_write_tokens: 2,
         };
 
-        assert_eq!(usage.billable(), 20);
-        assert_eq!(usage.cache(), 950);
-        assert_eq!(usage.total(), 970);
+        assert_eq!(usage.primary(), 18);
+        assert_eq!(usage.reasoning(), 5);
+        assert_eq!(usage.cache(), 15);
+        assert_eq!(usage.observed_total(), 38);
+    }
+
+    #[test]
+    fn legacy_token_usage_without_reasoning_tokens_reconciles_observed_total() {
+        let usage = serde_json::from_value::<TokenUsage>(serde_json::json!({
+            "inputTokens": 11,
+            "outputTokens": 7,
+            "cacheReadTokens": 13,
+            "cacheWriteTokens": 2
+        }))
+        .unwrap();
+
+        assert_eq!(usage.reasoning(), 0);
+        assert_eq!(usage.observed_total(), 33);
     }
 
     #[test]
@@ -664,7 +687,7 @@ mod tests {
         let executor = usage.iter().find(|item| item.agent == "executor").unwrap();
         assert_eq!(executor.calls, 2);
         assert_eq!(executor.tasks, 2);
-        assert_eq!(executor.tokens.billable(), 41);
+        assert_eq!(executor.tokens.primary(), 41);
     }
 
     #[test]
@@ -736,7 +759,7 @@ mod tests {
         let merged = merge_agent_usage(primary, fallback);
         assert_eq!(merged.len(), 2);
         let executor = merged.iter().find(|item| item.agent == "executor").unwrap();
-        assert_eq!(executor.tokens.billable(), 110);
+        assert_eq!(executor.tokens.primary(), 110);
         assert_eq!(
             merged
                 .iter()
@@ -874,7 +897,7 @@ mod tests {
         assert_eq!(merged.tokens.input_tokens, 17);
         assert_eq!(merged.tokens.output_tokens, 8);
         assert_eq!(merged.tokens.cache_read_tokens, 150);
-        assert_eq!(merged.tokens.billable(), 25);
+        assert_eq!(merged.tokens.primary(), 25);
         assert_eq!(merged.cost_microusd, Some(12));
     }
 
