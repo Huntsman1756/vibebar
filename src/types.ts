@@ -9,6 +9,7 @@ export type HistorySourceFidelity = "metadata" | "session-fallback" | "event-fal
 export type UsageHistoryRow = { day: string; repository: string; agent: string; provider: string; model: string; source: string; sourceFidelity: HistorySourceFidelity; messageCount: number; sessionCount: number; tokens: TokenUsage; costMicrousd: number | null };
 export type UsageHistory = { available?: boolean; rows: UsageHistoryRow[]; oldestDay: string | null; newestDay: string | null; truncated: boolean; repositoryAttributionEnabled: boolean };
 export type HistorySummary = {
+  observedTokens: number;
   billableTokens: number;
   cacheTokens: number;
   inputTokens: number;

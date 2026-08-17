@@ -109,7 +109,14 @@ function addRow(bucket: AggregateBucket, row: UsageHistoryRow): void {
 }
 
 function summarizeBucket(bucket: AggregateBucket) {
+  const observedTokens = bucket.inputTokens
+    + bucket.outputTokens
+    + bucket.reasoningTokens
+    + bucket.cacheReadTokens
+    + bucket.cacheWriteTokens;
+
   return {
+    observedTokens,
     billableTokens: bucket.inputTokens + bucket.outputTokens,
     cacheTokens: bucket.cacheReadTokens + bucket.cacheWriteTokens,
     inputTokens: bucket.inputTokens,
@@ -176,7 +183,7 @@ export function aggregateHistoryByProvider(rows: UsageHistoryRow[]): ProviderHis
       const [provider, model] = key.split("\u0000");
       return { provider, model, ...summarizeBucket(bucket) };
     })
-    .sort((left, right) => right.billableTokens - left.billableTokens
+    .sort((left, right) => right.observedTokens - left.observedTokens
       || compareText(left.provider, right.provider)
       || compareText(left.model, right.model));
 }
@@ -196,8 +203,51 @@ export function aggregateHistoryByProviderTotals(rows: UsageHistoryRow[]): Provi
       models: [...bucket.models].sort(compareText),
       ...summarizeBucket(bucket),
     }))
-    .sort((left, right) => right.billableTokens - left.billableTokens
+    .sort((left, right) => right.observedTokens - left.observedTokens
       || compareText(left.provider, right.provider));
+}
+
+function dailyProviderLabel(provider: string, labels: Map<string, string>): string {
+  return labels.get(provider) ?? provider
+    .split(/[-_/.:]+/)
+    .filter(Boolean)
+    .map((part) => part[0]?.toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+export function buildDailyProviderSeries(
+  rows: UsageHistoryRow[],
+  labels: Map<string, string>,
+  providerOrder: Map<string, number>,
+) {
+  const days = new Map<string, Map<string, number>>();
+
+  for (const row of rows) {
+    const total = row.tokens.inputTokens
+      + row.tokens.outputTokens
+      + (row.tokens.reasoningTokens ?? 0)
+      + row.tokens.cacheReadTokens
+      + row.tokens.cacheWriteTokens;
+    const providers = days.get(row.day) ?? new Map<string, number>();
+    providers.set(row.provider, (providers.get(row.provider) ?? 0) + total);
+    days.set(row.day, providers);
+  }
+
+  return [...days.entries()]
+    .sort(([left], [right]) => left.localeCompare(right, "en"))
+    .map(([day, providers]) => {
+      const series = [...providers.entries()]
+        .map(([provider, total]) => ({ provider, label: dailyProviderLabel(provider, labels), total }))
+        .sort((left, right) =>
+          (providerOrder.get(left.provider) ?? Number.MAX_SAFE_INTEGER) - (providerOrder.get(right.provider) ?? Number.MAX_SAFE_INTEGER)
+          || right.total - left.total
+          || left.provider.localeCompare(right.provider, "en"));
+      return {
+        day,
+        total: series.reduce((sum, item) => sum + item.total, 0),
+        providers: series,
+      };
+    });
 }
 
 export function buildProviderToneMap(
@@ -228,7 +278,7 @@ export function aggregateHistoryByRepository(rows: UsageHistoryRow[]): Repositor
       models: [...bucket.models].sort(compareText),
       ...summarizeBucket(bucket),
     }))
-    .sort((left, right) => right.billableTokens - left.billableTokens
+    .sort((left, right) => right.observedTokens - left.observedTokens
       || compareText(left.repository, right.repository));
 }
 
@@ -247,7 +297,7 @@ export function aggregateHistoryByAgent(rows: UsageHistoryRow[]): AgentHistorySu
       const [agent, provider, model, repository] = key.split("\u0000");
       return { agent, provider, model, repository, ...summarizeBucket(bucket) };
     })
-    .sort((left, right) => right.billableTokens - left.billableTokens
+    .sort((left, right) => right.observedTokens - left.observedTokens
       || compareText(left.agent, right.agent)
       || compareText(left.provider, right.provider)
       || compareText(left.model, right.model)

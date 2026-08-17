@@ -6,6 +6,7 @@ import {
   aggregateHistoryByProviderTotals,
   aggregateHistoryByRepository,
   buildProviderToneMap,
+  buildDailyProviderSeries,
   isHistoryUnavailable,
   historyStart,
   sanitizeRepositoryIdentifier,
@@ -197,8 +198,98 @@ describe("aggregateHistoryByProvider", () => {
 
     expect(tied.map((summary) => `${summary.provider}:${summary.model}`)).toEqual([
       "nan:qwen3.6",
-      "aaa-provider:model-a",
       "bbb-provider:model-a",
+      "aaa-provider:model-a",
+    ]);
+  });
+});
+
+describe("observed token totals", () => {
+  it("sums input, output, reasoning, cache read, and cache write into observedTokens", () => {
+    const row: UsageHistoryRow = {
+      ...rows[0],
+      tokens: { inputTokens: 11, outputTokens: 7, reasoningTokens: 5, cacheReadTokens: 13, cacheWriteTokens: 2 },
+    };
+
+    const [summary] = aggregateHistoryByProvider([row]);
+
+    expect(summary.observedTokens).toBe(38);
+  });
+
+  it("orders provider, repository, and agent summaries by observed total", () => {
+    const observedTotalRows: UsageHistoryRow[] = [
+      {
+        ...rows[0],
+        repository: "github.com/acme/observed",
+        agent: "observed-agent",
+        provider: "aaa-provider",
+        tokens: { inputTokens: 11, outputTokens: 7, reasoningTokens: 5, cacheReadTokens: 13, cacheWriteTokens: 2 },
+      },
+      {
+        ...rows[0],
+        repository: "github.com/acme/billable",
+        agent: "billable-agent",
+        provider: "bbb-provider",
+        tokens: { inputTokens: 30, outputTokens: 0, reasoningTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      },
+    ];
+
+    expect(aggregateHistoryByProvider(observedTotalRows).map((summary) => [summary.provider, summary.observedTokens])).toEqual([
+      ["aaa-provider", 38],
+      ["bbb-provider", 30],
+    ]);
+    expect(aggregateHistoryByRepository(observedTotalRows).map((summary) => [summary.repository, summary.observedTokens])).toEqual([
+      ["github.com/acme/observed", 38],
+      ["github.com/acme/billable", 30],
+    ]);
+    expect(aggregateHistoryByAgent(observedTotalRows).map((summary) => [summary.agent, summary.observedTokens])).toEqual([
+      ["observed-agent", 38],
+      ["billable-agent", 30],
+    ]);
+  });
+});
+
+describe("buildDailyProviderSeries", () => {
+  it("includes all five token counters in each day and provider total", () => {
+    const dailyRows: UsageHistoryRow[] = [
+      {
+        ...rows[0],
+        day: "2026-08-15",
+        provider: "aaa-provider",
+        tokens: { inputTokens: 2, outputTokens: 3, reasoningTokens: 4, cacheReadTokens: 5, cacheWriteTokens: 6 },
+      },
+      {
+        ...rows[0],
+        day: "2026-08-16",
+        provider: "aaa-provider",
+        tokens: { inputTokens: 1, outputTokens: 2, reasoningTokens: 3, cacheReadTokens: 4, cacheWriteTokens: 5 },
+      },
+      {
+        ...rows[0],
+        day: "2026-08-16",
+        provider: "bbb-provider",
+        tokens: { inputTokens: 10, outputTokens: 1, reasoningTokens: 2, cacheReadTokens: 3, cacheWriteTokens: 4 },
+      },
+    ];
+
+    expect(buildDailyProviderSeries(
+      dailyRows,
+      new Map([["aaa-provider", "Provider A"], ["bbb-provider", "Provider B"]]),
+      new Map([["aaa-provider", 0], ["bbb-provider", 1]]),
+    )).toEqual([
+      {
+        day: "2026-08-15",
+        total: 20,
+        providers: [{ provider: "aaa-provider", label: "Provider A", total: 20 }],
+      },
+      {
+        day: "2026-08-16",
+        total: 35,
+        providers: [
+          { provider: "aaa-provider", label: "Provider A", total: 15 },
+          { provider: "bbb-provider", label: "Provider B", total: 20 },
+        ],
+      },
     ]);
   });
 });
@@ -209,8 +300,8 @@ describe("aggregateHistoryByProviderTotals", () => {
 
     expect(summaries.map((summary) => `${summary.provider}:${summary.billableTokens}:${summary.models.join(",")}`)).toEqual([
       "nan:450:deepseek-v4-flash,qwen3.6",
-      "aaa-provider:100:model-a",
       "bbb-provider:100:model-a",
+      "aaa-provider:100:model-a",
       "opencode-go:100:qwen3.6",
     ]);
   });
