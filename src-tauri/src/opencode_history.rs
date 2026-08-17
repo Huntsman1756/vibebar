@@ -757,8 +757,8 @@ fn sort_agent_usage(usage: &mut [AgentUsage]) {
     usage.sort_by(|left, right| {
         right
             .tokens
-            .billable()
-            .cmp(&left.tokens.billable())
+            .observed_total()
+            .cmp(&left.tokens.observed_total())
             .then_with(|| right.calls.cmp(&left.calls))
             .then_with(|| left.agent.cmp(&right.agent))
             .then_with(|| left.provider.cmp(&right.provider))
@@ -783,6 +783,7 @@ mod tests {
         collect_history_from_connection, collect_opencode_agents_from_connection,
         collect_usage_from_connection, local_history_window_start_millis_for,
         merge_agent_usage_sources, query_message_history, query_session_history_fallback,
+        sort_agent_usage,
     };
     use crate::{
         domain::{AgentUsage, TokenUsage},
@@ -1226,6 +1227,67 @@ mod tests {
         assert_eq!(usage[0].tasks, 1);
         assert_eq!(usage[0].tokens.billable(), 17);
         assert_eq!(usage[0].tokens.cache(), 2);
+    }
+
+    #[test]
+    fn opencode_agent_usage_ranks_by_observed_total_instead_of_primary() {
+        let mut usage = vec![
+            AgentUsage {
+                agent: "primary-heavy".into(),
+                provider: "nan".into(),
+                model: "qwen3.6".into(),
+                source: MESSAGE_SOURCE.into(),
+                calls: 1,
+                tasks: 1,
+                tokens: TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+            },
+            AgentUsage {
+                agent: "cache-heavy".into(),
+                provider: "nan".into(),
+                model: "qwen3.6".into(),
+                source: MESSAGE_SOURCE.into(),
+                calls: 1,
+                tasks: 1,
+                tokens: TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                    cache_read_tokens: 500,
+                    cache_write_tokens: 0,
+                },
+            },
+            AgentUsage {
+                agent: "reasoning-heavy".into(),
+                provider: "nan".into(),
+                model: "qwen3.6".into(),
+                source: MESSAGE_SOURCE.into(),
+                calls: 1,
+                tasks: 1,
+                tokens: TokenUsage {
+                    input_tokens: 2,
+                    output_tokens: 0,
+                    reasoning_tokens: 700,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+            },
+        ];
+
+        sort_agent_usage(&mut usage);
+
+        assert_eq!(
+            usage
+                .iter()
+                .map(|item| item.agent.as_str())
+                .collect::<Vec<_>>(),
+            ["reasoning-heavy", "cache-heavy", "primary-heavy"]
+        );
     }
 
     #[test]

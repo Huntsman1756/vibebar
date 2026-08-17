@@ -206,8 +206,8 @@ fn reconcile_provider_cards_with_history(
         models.sort_by(|left, right| {
             right
                 .tokens
-                .billable()
-                .cmp(&left.tokens.billable())
+                .observed_total()
+                .cmp(&left.tokens.observed_total())
                 .then_with(|| right.calls.cmp(&left.calls))
                 .then_with(|| left.model.cmp(&right.model))
         });
@@ -500,6 +500,7 @@ mod tests {
     use super::{
         SnapshotBuildInputs, build_snapshot_from_sources, merge_history_sources,
         opencode_session_fallback_diagnostic, provider_history_from_events,
+        reconcile_provider_cards_with_history,
     };
     use crate::domain::{
         AgentUsage, EventKind, ProviderSnapshot, TokenUsage, UsageEvent, UsageHistory,
@@ -1172,6 +1173,50 @@ mod tests {
                 .iter()
                 .any(|row| { row.provider == "nan" && row.tokens.billable() == 990 })
         );
+    }
+
+    #[test]
+    fn history_only_provider_models_rank_by_observed_total_instead_of_primary() {
+        let mut cache_heavy = history_row(HistoryRowSpec {
+            day: "2026-08-16",
+            repository: "github.com/example/cache",
+            agent: "executor",
+            provider: "custom-provider",
+            model: "cache-heavy",
+            source: "opencode-db-messages-31d",
+            source_fidelity: "metadata",
+            input_tokens: 1,
+            output_tokens: 0,
+        });
+        cache_heavy.tokens.cache_read_tokens = 500;
+        let history = UsageHistory {
+            available: true,
+            rows: vec![
+                history_row(HistoryRowSpec {
+                    day: "2026-08-16",
+                    repository: "github.com/example/primary",
+                    agent: "executor",
+                    provider: "custom-provider",
+                    model: "primary-heavy",
+                    source: "opencode-db-messages-31d",
+                    source_fidelity: "metadata",
+                    input_tokens: 100,
+                    output_tokens: 0,
+                }),
+                cache_heavy,
+            ],
+            oldest_day: Some("2026-08-16".into()),
+            newest_day: Some("2026-08-16".into()),
+            truncated: false,
+            repository_attribution_enabled: true,
+        };
+
+        let providers = reconcile_provider_cards_with_history(Vec::new(), &history, Utc::now());
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].models[0].model, "cache-heavy");
+        assert_eq!(providers[0].models[0].tokens.primary(), 1);
+        assert_eq!(providers[0].models[0].tokens.observed_total(), 501);
     }
 
     #[test]

@@ -363,8 +363,8 @@ pub fn aggregate_agent_usage(events: &[UsageEvent], since: DateTime<Utc>) -> Vec
     usage.sort_by(|left, right| {
         right
             .tokens
-            .primary()
-            .cmp(&left.tokens.primary())
+            .observed_total()
+            .cmp(&left.tokens.observed_total())
             .then_with(|| right.calls.cmp(&left.calls))
             .then_with(|| left.agent.cmp(&right.agent))
             .then_with(|| left.provider.cmp(&right.provider))
@@ -395,8 +395,8 @@ pub fn merge_agent_usage(primary: Vec<AgentUsage>, fallback: Vec<AgentUsage>) ->
     merged.sort_by(|left, right| {
         right
             .tokens
-            .primary()
-            .cmp(&left.tokens.primary())
+            .observed_total()
+            .cmp(&left.tokens.observed_total())
             .then_with(|| right.calls.cmp(&left.calls))
             .then_with(|| left.agent.cmp(&right.agent))
             .then_with(|| left.provider.cmp(&right.provider))
@@ -485,8 +485,8 @@ pub fn aggregate_history_rows(rows: impl IntoIterator<Item = UsageHistoryRow>) -
     rows.sort_by(|left, right| {
         right
             .tokens
-            .primary()
-            .cmp(&left.tokens.primary())
+            .observed_total()
+            .cmp(&left.tokens.observed_total())
             .then_with(|| left.day.cmp(&right.day))
             .then_with(|| left.provider.cmp(&right.provider))
             .then_with(|| left.model.cmp(&right.model))
@@ -707,6 +707,54 @@ mod tests {
     }
 
     #[test]
+    fn agent_usage_ranks_by_observed_total_instead_of_primary() {
+        let since = Utc::now() - chrono::Duration::days(30);
+        let primary_heavy = token_event(
+            "primary-heavy",
+            "primary-task",
+            "primary-heavy",
+            EventKind::AttemptStarted,
+            since + chrono::Duration::hours(1),
+            100,
+            0,
+        );
+        let mut cache_heavy = token_event(
+            "cache-heavy",
+            "cache-task",
+            "cache-heavy",
+            EventKind::AttemptStarted,
+            since + chrono::Duration::hours(2),
+            1,
+            0,
+        );
+        let mut reasoning_heavy = token_event(
+            "reasoning-heavy",
+            "reasoning-task",
+            "reasoning-heavy",
+            EventKind::AttemptStarted,
+            since + chrono::Duration::hours(3),
+            2,
+            0,
+        );
+        cache_heavy.tokens.as_mut().unwrap().cache_read_tokens = 500;
+        reasoning_heavy.tokens.as_mut().unwrap().reasoning_tokens = 700;
+
+        let usage = aggregate_agent_usage(&[primary_heavy, cache_heavy, reasoning_heavy], since);
+
+        assert_eq!(
+            usage
+                .iter()
+                .map(|item| item.agent.as_str())
+                .collect::<Vec<_>>(),
+            ["reasoning-heavy", "cache-heavy", "primary-heavy"]
+        );
+        assert_eq!(usage[0].tokens.primary(), 2);
+        assert_eq!(usage[0].tokens.observed_total(), 702);
+        assert_eq!(usage[1].tokens.primary(), 1);
+        assert_eq!(usage[1].tokens.observed_total(), 501);
+    }
+
+    #[test]
     fn primary_opencode_agent_rows_replace_duplicate_event_rows() {
         let primary = vec![AgentUsage {
             agent: "executor".into(),
@@ -768,6 +816,46 @@ mod tests {
                 .source,
             "vibebar-events-30d"
         );
+    }
+
+    #[test]
+    fn merged_agent_usage_ranks_by_observed_total_instead_of_primary() {
+        let primary = vec![AgentUsage {
+            agent: "primary-heavy".into(),
+            provider: "nan".into(),
+            model: "qwen3.6".into(),
+            source: "opencode-db-30d".into(),
+            calls: 1,
+            tasks: 1,
+            tokens: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        }];
+        let fallback = vec![AgentUsage {
+            agent: "cache-heavy".into(),
+            provider: "nan".into(),
+            model: "qwen3.6".into(),
+            source: "vibebar-events-30d".into(),
+            calls: 1,
+            tasks: 1,
+            tokens: TokenUsage {
+                input_tokens: 1,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+                cache_read_tokens: 500,
+                cache_write_tokens: 0,
+            },
+        }];
+
+        let merged = merge_agent_usage(primary, fallback);
+
+        assert_eq!(merged[0].agent, "cache-heavy");
+        assert_eq!(merged[0].tokens.primary(), 1);
+        assert_eq!(merged[0].tokens.observed_total(), 501);
     }
 
     #[test]
@@ -1012,9 +1100,13 @@ mod tests {
                 agent: "executor",
                 provider: "nan",
                 model: "qwen3.6",
-                input_tokens: 10_000_u64.saturating_sub(index as u64),
+                input_tokens: if index == 1_000 {
+                    1
+                } else {
+                    10_000_u64.saturating_sub(index as u64)
+                },
                 output_tokens: 0,
-                cache_read_tokens: 0,
+                cache_read_tokens: if index == 1_000 { 20_000 } else { 0 },
                 message_count: 1,
                 session_count: 1,
                 cost_microusd: None,
@@ -1024,8 +1116,10 @@ mod tests {
         assert!(history.truncated);
         assert_eq!(history.rows.len(), USAGE_HISTORY_ROW_LIMIT);
         assert_eq!(
-            history.rows.last().map(|row| row.repository.as_str()),
-            Some("github.com/example/repo-0999")
+            history.rows.first().map(|row| row.repository.as_str()),
+            Some("github.com/example/repo-1000")
         );
+        assert_eq!(history.rows[0].tokens.primary(), 1);
+        assert_eq!(history.rows[0].tokens.observed_total(), 20_001);
     }
 }

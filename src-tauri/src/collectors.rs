@@ -231,7 +231,7 @@ pub fn parse_opencode_stats(output: &str) -> Result<Vec<ProviderSnapshot>, Strin
     Ok(grouped
         .into_iter()
         .map(|(provider, mut models)| {
-            models.sort_by_key(|model| std::cmp::Reverse(model.tokens.primary()));
+            models.sort_by_key(|model| std::cmp::Reverse(model.tokens.observed_total()));
             let calls = models.iter().map(|model| model.calls).sum();
             let tokens = sum_tokens(models.iter().map(|model| &model.tokens));
             ProviderSnapshot {
@@ -681,6 +681,21 @@ done
             Some(500_000_000)
         );
         assert!(providers.iter().any(|provider| provider.id == "openai"));
+    }
+
+    #[test]
+    fn parses_opencode_models_ranks_by_observed_total_instead_of_primary() {
+        let input = "│ nan/primary-heavy │\n│  Input Tokens 100 │\n│ nan/cache-heavy │\n│  Input Tokens 1 │\n│  Cache Read 500 │";
+
+        let providers = parse_opencode_stats(input).unwrap();
+        let nan = providers
+            .iter()
+            .find(|provider| provider.id == "nan")
+            .unwrap();
+
+        assert_eq!(nan.models[0].model, "cache-heavy");
+        assert_eq!(nan.models[0].tokens.primary(), 1);
+        assert_eq!(nan.models[0].tokens.observed_total(), 501);
     }
 
     #[test]
