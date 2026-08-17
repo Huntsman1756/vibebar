@@ -57,7 +57,15 @@ Unknown fields are rejected. Identifiers are non-empty, bounded, and cannot cont
 - **Escalations:** `escalated` events, including economy-model escalation or frontier escalation as described by `role`.
 - **Cost per accepted:** sum of provided `costMicrousd` divided by accepted tasks. It remains unavailable when the source does not provide cost.
 
-When `tokens` is present, VibeBar reports **billable tokens** as `inputTokens + outputTokens` and keeps `cacheReadTokens + cacheWriteTokens` as a separate cache metric. Cache tokens are never included in a provider quota percentage. The dashboard groups token-bearing events by `role`, `provider`, and `model` over the most recent 30 days for agent/role attribution; OpenCode's independent 30-day provider totals are not merged into those event groups.
+When `tokens` is present, VibeBar reports each observed component separately:
+
+- **Primary traffic:** `inputTokens + outputTokens`.
+- **Reasoning tokens:** the source-provided `reasoningTokens` counter, defaulting to zero for legacy events that omit it.
+- **Cache read tokens:** the source-provided `cacheReadTokens` counter.
+- **Cache write tokens:** the source-provided `cacheWriteTokens` counter.
+- **Observed total:** primary traffic plus reasoning, cache read, and cache write tokens.
+
+Published allowances are reference metadata only. Percentage fields remain null unless an authoritative provider meter for the same window supplies both usage and limit; local counters never become a guessed quota numerator. The dashboard groups token-bearing events by `role`, `provider`, and `model` over the most recent 30 days for agent/role attribution; OpenCode's independent 30-day provider totals are not merged into those event groups.
 
 For historical usage, V1 events can only provide a provider/model/agent/day fallback. They do not carry repository attribution, and they do not distinguish assistant-message metadata from session-level OpenCode history. Event-only rows therefore surface as lower-fidelity fallback data unless a future explicitly sanitized schema version adds a repository identifier.
 

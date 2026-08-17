@@ -61,16 +61,17 @@ The backend keeps only the most recent 31 local calendar days. The frontend slic
 
 ## Metric semantics
 
-Billable tokens are exactly `input + output`. Cache tokens are `cache read + cache write`, shown separately and never added into quota percentages.
+Every token object keeps the source counters separate:
 
-For a model with a documented quota:
+- **Primary traffic:** `inputTokens + outputTokens`.
+- **Reasoning tokens:** the source-provided reasoning counter.
+- **Cache read tokens:** the source-provided `cacheReadTokens` counter.
+- **Cache write tokens:** the source-provided `cacheWriteTokens` counter.
+- **Observed total:** primary traffic plus reasoning, cache read, and cache write tokens.
 
-```text
-usedPercent = billableTokens / quotaTokens * 100
-remainingPercent = max(0, 100 - usedPercent)
-```
+Published allowances are reference metadata only. A percentage is available only when an authoritative provider meter for the same window supplies both usage and limit. Local token counters never become a guessed quota numerator, so `usedPercent` and `remainingPercent` remain unavailable when only local data and a published allowance exist. The UI shows `Cuota no medible con datos locales` for that state and `Sin cuota conocida` when no allowance reference exists.
 
-Quota percentages may exceed 100 in detailed views so exhausted limits stay visible. Compact progress bars are capped visually.
+Provider-supplied percentage windows, such as the Codex App Server rate-limit windows, remain available because their usage and limit come from the same authoritative source.
 
 ## Provider and repository semantics
 

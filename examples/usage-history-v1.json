@@ -19,6 +19,25 @@
       "costMicrousd": 35000
     },
     {
+      "day": "2026-08-14",
+      "repository": "github.com/example/alpha",
+      "agent": "executor",
+      "provider": "nan",
+      "model": "deepseek-v4-flash",
+      "source": "opencode-db-messages-31d",
+      "sourceFidelity": "metadata",
+      "messageCount": 1,
+      "sessionCount": 1,
+      "tokens": {
+        "inputTokens": 11,
+        "outputTokens": 7,
+        "reasoningTokens": 5,
+        "cacheReadTokens": 13,
+        "cacheWriteTokens": 2
+      },
+      "costMicrousd": null
+    },
+    {
       "day": "2026-08-15",
       "repository": "local/demo-project",
       "agent": "reviewer",
