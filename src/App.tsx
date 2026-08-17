@@ -42,12 +42,16 @@ const historyRanges: { value: HistoryRange; label: string }[] = [
 const historyBarTones = ["mint", "violet", "amber", "slate"] as const;
 
 const formatTokens = (value: number) => `${compact.format(value)} tok`;
-const billableTokens = (tokens: { inputTokens: number; outputTokens: number }) => tokens.inputTokens + tokens.outputTokens;
+export const primaryTokens = (tokens: { inputTokens: number; outputTokens: number }) => tokens.inputTokens + tokens.outputTokens;
 const reasoningTokens = (tokens: { reasoningTokens?: number }) => tokens.reasoningTokens ?? 0;
 const cacheTokens = (tokens: { cacheReadTokens: number; cacheWriteTokens: number }) => tokens.cacheReadTokens + tokens.cacheWriteTokens;
 const observedTokens = (tokens: { inputTokens: number; outputTokens: number; reasoningTokens?: number; cacheReadTokens: number; cacheWriteTokens: number }) =>
   tokens.inputTokens + tokens.outputTokens + reasoningTokens(tokens) + tokens.cacheReadTokens + tokens.cacheWriteTokens;
 const quotaPercent = (value: number | null) => value == null ? "—" : `${value.toFixed(value < 10 ? 1 : 0)}%`;
+const localUnmeasurableQuotaLabel = "Cuota no medible con datos locales";
+
+export const hasCompleteQuotaMeter = (quota: Pick<ModelQuota, "usedPercent" | "remainingPercent">) =>
+  quota.usedPercent != null && quota.remainingPercent != null;
 
 function toLocalIsoDay(value: Date) {
   return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
@@ -109,7 +113,7 @@ function historyRangeLabel(value: HistoryRange) {
 function summarizeHistoryRows(rows: UsageHistoryRow[]) {
   return rows.reduce((summary, row) => {
     summary.observedTokens += observedTokens(row.tokens);
-    summary.billableTokens += billableTokens(row.tokens);
+    summary.billableTokens += primaryTokens(row.tokens);
     summary.inputTokens += row.tokens.inputTokens;
     summary.outputTokens += row.tokens.outputTokens;
     summary.reasoningTokens += reasoningTokens(row.tokens);
@@ -138,24 +142,27 @@ function WindowMeter({ window }: { window: QuotaWindow }) {
 }
 
 function QuotaMeter({ quota }: { quota: ModelQuota }) {
-  const limited = quota.usedPercent != null && quota.usedPercent > 80;
+  const metered = hasCompleteQuotaMeter(quota);
+  const limited = metered && quota.usedPercent != null && quota.usedPercent > 80;
   return <div className="quota-row">
     <div className="quota-copy"><span>{quota.label}</span><small>{quota.periodLabel}</small></div>
-    <div className="quota-value">{quotaPercent(quota.usedPercent)}</div>
-    {quota.usedPercent == null ? <small className="quota-unavailable">Cuota no medible con datos locales</small> : <div className="quota-progress"><Progress value={quota.usedPercent} tone={limited ? "amber" : "violet"} /><small>{quotaPercent(quota.remainingPercent)} left</small></div>}
+    <div className="quota-value">{metered ? quotaPercent(quota.usedPercent) : "—"}</div>
+    {metered ? <div className="quota-progress"><Progress value={quota.usedPercent ?? 0} tone={limited ? "amber" : "violet"} /><small>{quotaPercent(quota.remainingPercent)} left</small></div> : <small className="quota-unavailable">{localUnmeasurableQuotaLabel}</small>}
   </div>;
 }
 
 function ModelRow({ model }: { model: ModelUsage }) {
   const observed = observedTokens(model.tokens);
+  const primary = primaryTokens(model.tokens);
   return <div className="model-row">
-    <div className="model-main"><span className="model-dot" /><div><strong>{model.model}</strong><small>{compact.format(model.calls)} calls · {formatTokens(observed)} observed</small><small>{formatTokens(model.tokens.inputTokens)} input · {formatTokens(model.tokens.outputTokens)} output</small><small>{formatTokens(reasoningTokens(model.tokens))} reasoning · {formatTokens(model.tokens.cacheReadTokens)} cache read · {formatTokens(model.tokens.cacheWriteTokens)} cache write</small></div></div>
+    <div className="model-main"><span className="model-dot" /><div><strong>{model.model}</strong><small>{compact.format(model.calls)} calls · {formatTokens(observed)} observed</small><small>{formatTokens(primary)} Primary (input + output)</small><small>{formatTokens(model.tokens.inputTokens)} input · {formatTokens(model.tokens.outputTokens)} output</small><small>{formatTokens(reasoningTokens(model.tokens))} reasoning · {formatTokens(model.tokens.cacheReadTokens)} cache read · {formatTokens(model.tokens.cacheWriteTokens)} cache write</small></div></div>
     {model.quotaWindows.length === 0 ? <span className="limit-pill">Sin cuota conocida</span> : <div className="quota-stack">{model.quotaWindows.map((quota) => <QuotaMeter key={`${model.model}-${quota.label}`} quota={quota} />)}</div>}
   </div>;
 }
 
 function ProviderCard({ provider }: { provider: ProviderSnapshot }) {
   const observed = observedTokens(provider.tokens);
+  const primary = primaryTokens(provider.tokens);
   return <article className={`provider-card ${provider.status === "error" ? "provider-error" : ""}`}>
     <header>
       <div className={`provider-mark ${provider.id === "nan" ? "nan" : "chatgpt"}`}>{provider.id === "nan" ? "N" : "✦"}</div>
@@ -164,24 +171,25 @@ function ProviderCard({ provider }: { provider: ProviderSnapshot }) {
     </header>
     {provider.error ? <p className="provider-error-copy">{provider.error}</p> : null}
     {provider.windows.length > 0 ? <div className="window-grid">{provider.windows.map((window) => <WindowMeter key={window.label} window={window} />)}</div> : null}
-    {provider.models.length > 0 ? <><div className="provider-total"><div><span>30-day observed total</span><strong>{formatTokens(observed)}</strong></div><div><span>Input</span><strong>{formatTokens(provider.tokens.inputTokens)}</strong></div><div><span>Output</span><strong>{formatTokens(provider.tokens.outputTokens)}</strong></div><div><span>Reasoning</span><strong>{formatTokens(reasoningTokens(provider.tokens))}</strong></div><div><span>Cache read</span><strong className="token-secondary">{formatTokens(provider.tokens.cacheReadTokens)}</strong></div><div><span>Cache write</span><strong className="token-secondary">{formatTokens(provider.tokens.cacheWriteTokens)}</strong></div><div><span>Calls</span><strong>{compact.format(provider.calls)}</strong></div></div><div className="model-list">{provider.models.slice(0, 5).map((model) => <ModelRow key={model.model} model={model} />)}</div></> : null}
+    {provider.models.length > 0 ? <><div className="provider-total"><div><span>30-day observed total</span><strong>{formatTokens(observed)}</strong></div><div><span>Primary (input + output)</span><strong>{formatTokens(primary)}</strong></div><div><span>Input</span><strong>{formatTokens(provider.tokens.inputTokens)}</strong></div><div><span>Output</span><strong>{formatTokens(provider.tokens.outputTokens)}</strong></div><div><span>Reasoning</span><strong>{formatTokens(reasoningTokens(provider.tokens))}</strong></div><div><span>Cache read</span><strong className="token-secondary">{formatTokens(provider.tokens.cacheReadTokens)}</strong></div><div><span>Cache write</span><strong className="token-secondary">{formatTokens(provider.tokens.cacheWriteTokens)}</strong></div><div><span>Calls</span><strong>{compact.format(provider.calls)}</strong></div></div><div className="model-list">{provider.models.slice(0, 5).map((model) => <ModelRow key={model.model} model={model} />)}</div></> : null}
   </article>;
 }
 
 function AgentUsagePanel({ usage }: { usage: typeof demoSnapshot.agentUsage }) {
   return <section className="agent-panel">
     <div className="section-head compact"><div><p className="eyebrow">AGENTS / ROLES</p><h2>Who spent the tokens</h2></div><span>Last 30 days</span></div>
-    {usage.length === 0 ? <div className="empty agent-empty"><span>⌁</span><strong>No agent token attribution yet</strong><p>Append VibeBar events with a role and optional token usage to see which agents are spending.</p></div> : <div className="agent-list">{usage.slice(0, 12).map((item) => <div className="agent-row" key={`${item.agent}-${item.provider}-${item.model}`}><div className="agent-identity"><span className="agent-mark">{item.agent.slice(0, 1).toUpperCase()}</span><div><strong>{item.agent}</strong><small>{item.provider} / {item.model}</small></div></div><div className="agent-stat"><span>{formatTokens(observedTokens(item.tokens))}</span><small>observed</small><small>{formatTokens(item.tokens.inputTokens)} input · {formatTokens(item.tokens.outputTokens)} output</small><small>{formatTokens(reasoningTokens(item.tokens))} reasoning · {formatTokens(item.tokens.cacheReadTokens)} cache read · {formatTokens(item.tokens.cacheWriteTokens)} cache write</small></div><div className="agent-stat compact-stat"><span>{compact.format(item.calls)}</span><small>calls · {compact.format(item.tasks)} tasks</small></div></div>)}</div>}
+    {usage.length === 0 ? <div className="empty agent-empty"><span>⌁</span><strong>No agent token attribution yet</strong><p>Append VibeBar events with a role and optional token usage to see which agents are spending.</p></div> : <div className="agent-list">{usage.slice(0, 12).map((item) => <div className="agent-row" key={`${item.agent}-${item.provider}-${item.model}`}><div className="agent-identity"><span className="agent-mark">{item.agent.slice(0, 1).toUpperCase()}</span><div><strong>{item.agent}</strong><small>{item.provider} / {item.model}</small></div></div><div className="agent-stat"><span>{formatTokens(observedTokens(item.tokens))}</span><small>observed</small><small>{formatTokens(primaryTokens(item.tokens))} Primary (input + output)</small><small>{formatTokens(item.tokens.inputTokens)} input · {formatTokens(item.tokens.outputTokens)} output</small><small>{formatTokens(reasoningTokens(item.tokens))} reasoning · {formatTokens(item.tokens.cacheReadTokens)} cache read · {formatTokens(item.tokens.cacheWriteTokens)} cache write</small></div><div className="agent-stat compact-stat"><span>{compact.format(item.calls)}</span><small>calls · {compact.format(item.tasks)} tasks</small></div></div>)}</div>}
   </section>;
 }
 
 function CompactProviderCard({ provider }: { provider: ProviderSnapshot }) {
   const observed = observedTokens(provider.tokens);
+  const primary = primaryTokens(provider.tokens);
   return <article className={`compact-provider ${provider.status === "error" ? "provider-error" : ""}`}>
     <header><div className={`provider-mark ${provider.id === "nan" ? "nan" : "chatgpt"}`}>{provider.id === "nan" ? "N" : "✦"}</div><div className="provider-heading"><h3>{provider.label}</h3><span>{provider.source}</span></div><span className={`status-badge ${provider.status}`}><i />{provider.status}</span></header>
     {provider.error ? <p className="provider-error-copy">{provider.error}</p> : null}
     {provider.windows.length > 0 ? <div className="compact-window-grid">{provider.windows.map((window) => <WindowMeter key={window.label} window={window} />)}</div> : null}
-    {provider.models.length > 0 ? <><div className="compact-provider-total"><strong>{formatTokens(observed)}</strong><span>observed · {formatTokens(provider.tokens.inputTokens)} input · {formatTokens(provider.tokens.outputTokens)} output · {formatTokens(reasoningTokens(provider.tokens))} reasoning · {formatTokens(provider.tokens.cacheReadTokens)} cache read · {formatTokens(provider.tokens.cacheWriteTokens)} cache write · {compact.format(provider.calls)} calls</span></div><div className="compact-model-list">{provider.models.slice(0, 3).map((model) => { const quota = model.quotaWindows.find((item) => item.usedPercent != null) ?? model.quotaWindows[0]; return <div className="compact-model" key={model.model}><div><strong>{model.model}</strong><small>{compact.format(model.calls)} calls · {formatTokens(observedTokens(model.tokens))} observed</small><small>{formatTokens(model.tokens.inputTokens)} input · {formatTokens(model.tokens.outputTokens)} output · {formatTokens(reasoningTokens(model.tokens))} reasoning · {formatTokens(model.tokens.cacheReadTokens)} cache read · {formatTokens(model.tokens.cacheWriteTokens)} cache write</small></div><span>{quota ? quota.usedPercent == null ? "Cuota no medible con datos locales" : `${quotaPercent(quota.remainingPercent)} left` : "Sin cuota conocida"}</span></div>; })}</div></> : <p className="compact-empty">{provider.id === "chatgpt-codex" ? "Subscription windows only; token totals are not exposed by Codex." : "No model traffic available."}</p>}
+    {provider.models.length > 0 ? <><div className="compact-provider-total"><strong>{formatTokens(observed)}</strong><span>observed · {formatTokens(primary)} Primary (input + output) · {formatTokens(provider.tokens.inputTokens)} input · {formatTokens(provider.tokens.outputTokens)} output · {formatTokens(reasoningTokens(provider.tokens))} reasoning · {formatTokens(provider.tokens.cacheReadTokens)} cache read · {formatTokens(provider.tokens.cacheWriteTokens)} cache write · {compact.format(provider.calls)} calls</span></div><div className="compact-model-list">{provider.models.slice(0, 3).map((model) => { const quota = model.quotaWindows.find((item) => hasCompleteQuotaMeter(item)) ?? model.quotaWindows[0]; return <div className="compact-model" key={model.model}><div><strong>{model.model}</strong><small>{compact.format(model.calls)} calls · {formatTokens(observedTokens(model.tokens))} observed</small><small>{formatTokens(primaryTokens(model.tokens))} Primary (input + output)</small><small>{formatTokens(model.tokens.inputTokens)} input · {formatTokens(model.tokens.outputTokens)} output · {formatTokens(reasoningTokens(model.tokens))} reasoning · {formatTokens(model.tokens.cacheReadTokens)} cache read · {formatTokens(model.tokens.cacheWriteTokens)} cache write</small></div><span>{quota ? hasCompleteQuotaMeter(quota) ? `${quotaPercent(quota.remainingPercent)} left` : localUnmeasurableQuotaLabel : "Sin cuota conocida"}</span></div>; })}</div></> : <p className="compact-empty">{provider.id === "chatgpt-codex" ? "Subscription windows only; token totals are not exposed by Codex." : "No model traffic available."}</p>}
   </article>;
 }
 
@@ -248,12 +256,13 @@ function ProviderHistoryTable({ summaries, providerLabels }: { summaries: Provid
     <div className="history-table-head"><div><p className="eyebrow">BY PROVIDER / MODEL</p><h3>Observed usage by source</h3></div><span>{summaries.length} row{summaries.length === 1 ? "" : "s"}</span></div>
     <table className="history-table">
       <caption className="sr-only">Historical usage grouped by provider and model</caption>
-      <thead><tr><th>Provider / model</th><th>Source fidelity</th><th>Observed total</th><th>Input</th><th>Output</th><th>Reasoning</th><th>Cache read</th><th>Cache write</th><th>Msgs</th><th>Sessions</th><th>Observed cost</th></tr></thead>
+      <thead><tr><th>Provider / model</th><th>Source fidelity</th><th>Observed total</th><th>Primary (input + output)</th><th>Input</th><th>Output</th><th>Reasoning</th><th>Cache read</th><th>Cache write</th><th>Msgs</th><th>Sessions</th><th>Observed cost</th></tr></thead>
       <tbody>
         {summaries.map((summary) => <tr key={`${summary.provider}-${summary.model}`}>
           <td><strong>{providerLabel(summary.provider, providerLabels)}</strong><small>{summary.model}</small></td>
           <td><SourceBadges sourceFidelities={summary.sourceFidelities} sources={summary.sources} /></td>
           <td>{formatTokens(summary.observedTokens)}</td>
+          <td>{formatTokens(summary.billableTokens)}</td>
           <td>{formatTokens(summary.inputTokens)}</td>
           <td>{formatTokens(summary.outputTokens)}</td>
           <td>{formatTokens(summary.reasoningTokens)}</td>
@@ -273,13 +282,14 @@ function RepositoryHistoryTable({ summaries }: { summaries: RepositoryHistorySum
     <div className="history-table-head"><div><p className="eyebrow">BY REPOSITORY</p><h3>Normalized local attribution</h3></div><span>{summaries.length} repo{summaries.length === 1 ? "" : "s"}</span></div>
     <table className="history-table">
       <caption className="sr-only">Historical usage grouped by repository</caption>
-      <thead><tr><th>Repository</th><th>Providers</th><th>Source fidelity</th><th>Observed total</th><th>Input</th><th>Output</th><th>Reasoning</th><th>Cache read</th><th>Cache write</th><th>Msgs</th><th>Sessions</th></tr></thead>
+      <thead><tr><th>Repository</th><th>Providers</th><th>Source fidelity</th><th>Observed total</th><th>Primary (input + output)</th><th>Input</th><th>Output</th><th>Reasoning</th><th>Cache read</th><th>Cache write</th><th>Msgs</th><th>Sessions</th></tr></thead>
       <tbody>
         {summaries.map((summary) => <tr key={summary.repository}>
           <td><strong>{repositoryLabel(summary.repository)}</strong><small>{summary.models.join(" · ")}</small></td>
           <td>{summary.providers.join(" · ")}</td>
           <td><SourceBadges sourceFidelities={summary.sourceFidelities} sources={summary.sources} /></td>
           <td>{formatTokens(summary.observedTokens)}</td>
+          <td>{formatTokens(summary.billableTokens)}</td>
           <td>{formatTokens(summary.inputTokens)}</td>
           <td>{formatTokens(summary.outputTokens)}</td>
           <td>{formatTokens(summary.reasoningTokens)}</td>
@@ -298,7 +308,7 @@ function AgentHistoryTable({ summaries, providerLabels }: { summaries: AgentHist
     <div className="history-table-head"><div><p className="eyebrow">BY AGENT</p><h3>Context for the spend</h3></div><span>{summaries.length} row{summaries.length === 1 ? "" : "s"}</span></div>
     <table className="history-table">
       <caption className="sr-only">Historical usage grouped by agent, provider, model, and repository</caption>
-      <thead><tr><th>Agent</th><th>Provider / model</th><th>Repository</th><th>Source fidelity</th><th>Observed total</th><th>Input</th><th>Output</th><th>Reasoning</th><th>Cache read</th><th>Cache write</th><th>Sessions</th><th>Observed cost</th></tr></thead>
+      <thead><tr><th>Agent</th><th>Provider / model</th><th>Repository</th><th>Source fidelity</th><th>Observed total</th><th>Primary (input + output)</th><th>Input</th><th>Output</th><th>Reasoning</th><th>Cache read</th><th>Cache write</th><th>Sessions</th><th>Observed cost</th></tr></thead>
       <tbody>
         {summaries.map((summary) => <tr key={`${summary.agent}-${summary.provider}-${summary.model}-${summary.repository}`}>
           <td><strong>{summary.agent}</strong></td>
@@ -306,6 +316,7 @@ function AgentHistoryTable({ summaries, providerLabels }: { summaries: AgentHist
           <td>{repositoryLabel(summary.repository)}</td>
           <td><SourceBadges sourceFidelities={summary.sourceFidelities} sources={summary.sources} /></td>
           <td>{formatTokens(summary.observedTokens)}</td>
+          <td>{formatTokens(summary.billableTokens)}</td>
           <td>{formatTokens(summary.inputTokens)}</td>
           <td>{formatTokens(summary.outputTokens)}</td>
           <td>{formatTokens(summary.reasoningTokens)}</td>
@@ -347,7 +358,8 @@ function HistoryPanel({ snapshot, providerLabels, range, onRangeChange }: { snap
       {hasSessionFallback ? <div className="history-note">Session fallback is lower fidelity: whole sessions can land on their last update day instead of exact assistant-message timestamps.</div> : null}
       {!history.repositoryAttributionEnabled ? <div className="history-note">Repository attribution is disabled for this snapshot, so repository rows stay grouped under the explicit disabled label.</div> : null}
       <div className="history-summary-grid">
-        <div className="history-summary-card"><span>Observed total</span><strong>{formatTokens(totals.observedTokens)}</strong><small>Input, output, reasoning, and cache counters</small></div>
+        <div className="history-summary-card"><span>Observed total</span><strong>{formatTokens(totals.observedTokens)}</strong><small>Primary traffic plus reasoning and cache counters</small></div>
+        <div className="history-summary-card"><span>Primary (input + output)</span><strong>{formatTokens(totals.billableTokens)}</strong><small>Input + output traffic</small></div>
         <div className="history-summary-card"><span>Input</span><strong>{formatTokens(totals.inputTokens)}</strong><small>Reported input tokens</small></div>
         <div className="history-summary-card"><span>Output</span><strong>{formatTokens(totals.outputTokens)}</strong><small>Reported output tokens</small></div>
         <div className="history-summary-card"><span>Reasoning</span><strong>{formatTokens(totals.reasoningTokens)}</strong><small>Reported separately by message metadata</small></div>
@@ -384,14 +396,14 @@ function CompactHistorySummary({ snapshot, providerLabels, range, onRangeChange 
     <div className="compact-section-head"><span>HISTORICAL USAGE</span><small>{historyRangeLabel(range)}</small></div>
     <HistoryRangeButtons value={range} onChange={onRangeChange} compact />
     {!history ? <p className="compact-empty">Loading local history…</p> : unavailable ? <p className="compact-empty">Historical usage is unavailable right now.</p> : empty ? <p className="compact-empty">No history rows for this period yet.</p> : <>
-      <div className="compact-history-total"><strong>{formatTokens(totals.observedTokens)}</strong><span>observed · {formatTokens(totals.inputTokens)} input · {formatTokens(totals.outputTokens)} output · {formatTokens(totals.reasoningTokens)} reasoning · {formatTokens(totals.cacheReadTokens)} cache read · {formatTokens(totals.cacheWriteTokens)} cache write · {compact.format(totals.messages)} msgs · {compact.format(totals.sessions)} sessions</span></div>
+      <div className="compact-history-total"><strong>{formatTokens(totals.observedTokens)}</strong><span>observed · {formatTokens(totals.billableTokens)} Primary (input + output) · {formatTokens(totals.inputTokens)} input · {formatTokens(totals.outputTokens)} output · {formatTokens(totals.reasoningTokens)} reasoning · {formatTokens(totals.cacheReadTokens)} cache read · {formatTokens(totals.cacheWriteTokens)} cache write · {compact.format(totals.messages)} msgs · {compact.format(totals.sessions)} sessions</span></div>
       <div className="compact-mini-group">
         <div className="compact-mini-head"><span>Top providers</span><small>{providers.length} shown</small></div>
-        <div className="compact-mini-list">{providers.map((provider) => <div className="compact-mini-row" key={provider.provider}><strong>{providerLabel(provider.provider, providerLabels)}</strong><small>{provider.models.join(" · ")}</small><span>{formatTokens(provider.observedTokens)} observed</span><small>{formatTokens(provider.inputTokens)} input · {formatTokens(provider.outputTokens)} output · {formatTokens(provider.reasoningTokens)} reasoning · {formatTokens(provider.cacheReadTokens)} cache read · {formatTokens(provider.cacheWriteTokens)} cache write</small></div>)}</div>
+        <div className="compact-mini-list">{providers.map((provider) => <div className="compact-mini-row" key={provider.provider}><strong>{providerLabel(provider.provider, providerLabels)}</strong><small>{provider.models.join(" · ")}</small><span>{formatTokens(provider.observedTokens)} observed</span><small>{formatTokens(provider.billableTokens)} Primary (input + output)</small><small>{formatTokens(provider.inputTokens)} input · {formatTokens(provider.outputTokens)} output · {formatTokens(provider.reasoningTokens)} reasoning · {formatTokens(provider.cacheReadTokens)} cache read · {formatTokens(provider.cacheWriteTokens)} cache write</small></div>)}</div>
       </div>
       <div className="compact-mini-group">
         <div className="compact-mini-head"><span>Top repositories</span><small>{repositories.length} shown</small></div>
-        <div className="compact-mini-list">{repositories.map((repository) => <div className="compact-mini-row" key={repository.repository}><strong>{repositoryLabel(repository.repository)}</strong><small>{repository.providers.join(" · ")}</small><span>{formatTokens(repository.observedTokens)} observed</span><small>{formatTokens(repository.inputTokens)} input · {formatTokens(repository.outputTokens)} output · {formatTokens(repository.reasoningTokens)} reasoning · {formatTokens(repository.cacheReadTokens)} cache read · {formatTokens(repository.cacheWriteTokens)} cache write</small></div>)}</div>
+        <div className="compact-mini-list">{repositories.map((repository) => <div className="compact-mini-row" key={repository.repository}><strong>{repositoryLabel(repository.repository)}</strong><small>{repository.providers.join(" · ")}</small><span>{formatTokens(repository.observedTokens)} observed</span><small>{formatTokens(repository.billableTokens)} Primary (input + output)</small><small>{formatTokens(repository.inputTokens)} input · {formatTokens(repository.outputTokens)} output · {formatTokens(repository.reasoningTokens)} reasoning · {formatTokens(repository.cacheReadTokens)} cache read · {formatTokens(repository.cacheWriteTokens)} cache write</small></div>)}</div>
       </div>
       {hasSessionFallback ? <p className="compact-history-note">Session fallback rows are lower fidelity.</p> : null}
     </>}
@@ -427,7 +439,7 @@ function PopoverDashboard({
       {preview ? <div className="popover-notice">Browser preview · sample data</div> : null}
       <div className="compact-provider-list">{providers.map((provider) => <CompactProviderCard key={provider.id} provider={provider} />)}{!snapshot ? <div className="compact-provider skeleton" /> : null}</div>
       <CompactHistorySummary snapshot={snapshot} providerLabels={providerLabels} range={historyRange} onRangeChange={onHistoryRangeChange} />
-      <section className="compact-agents"><div className="compact-section-head"><span>TOP AGENTS / ROLES</span><small>30 days</small></div>{(snapshot?.agentUsage.length ?? 0) === 0 ? <p className="compact-empty">No role token data yet.</p> : <div className="compact-agent-list">{snapshot?.agentUsage.slice(0, 3).map((item) => <div className="compact-agent" key={`${item.agent}-${item.provider}-${item.model}`}><span className="agent-mark">{item.agent.slice(0, 1).toUpperCase()}</span><div><strong>{item.agent}</strong><small>{item.provider} / {item.model}</small><small>{formatTokens(item.tokens.inputTokens)} input · {formatTokens(item.tokens.outputTokens)} output · {formatTokens(reasoningTokens(item.tokens))} reasoning · {formatTokens(item.tokens.cacheReadTokens)} cache read · {formatTokens(item.tokens.cacheWriteTokens)} cache write</small></div><span className="compact-agent-tokens">{formatTokens(observedTokens(item.tokens))}</span></div>)}</div>}</section>
+      <section className="compact-agents"><div className="compact-section-head"><span>TOP AGENTS / ROLES</span><small>30 days</small></div>{(snapshot?.agentUsage.length ?? 0) === 0 ? <p className="compact-empty">No role token data yet.</p> : <div className="compact-agent-list">{snapshot?.agentUsage.slice(0, 3).map((item) => <div className="compact-agent" key={`${item.agent}-${item.provider}-${item.model}`}><span className="agent-mark">{item.agent.slice(0, 1).toUpperCase()}</span><div><strong>{item.agent}</strong><small>{item.provider} / {item.model}</small><small>{formatTokens(primaryTokens(item.tokens))} Primary (input + output)</small><small>{formatTokens(item.tokens.inputTokens)} input · {formatTokens(item.tokens.outputTokens)} output · {formatTokens(reasoningTokens(item.tokens))} reasoning · {formatTokens(item.tokens.cacheReadTokens)} cache read · {formatTokens(item.tokens.cacheWriteTokens)} cache write</small></div><span className="compact-agent-tokens">{formatTokens(observedTokens(item.tokens))}</span></div>)}</div>}</section>
       {(snapshot?.diagnostics.length ?? 0) > 0 ? <details className="compact-diagnostics"><summary>{snapshot?.diagnostics.length} source issue(s)</summary>{snapshot?.diagnostics.map((item) => <p key={item}>{item}</p>)}</details> : null}
       {error ? <p className="compact-error">{error}</p> : null}
       <button className="open-dashboard" onClick={openFull}>Open full dashboard <span>↗</span></button>
