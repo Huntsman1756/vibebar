@@ -5,8 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
-    "check": "npm run build && npm run test:rust",
+    "build": "tsc && vite build --configLoader runner",
+    "test": "npm run test:frontend && npm run test:rust",
+    "test:frontend": "vitest run --configLoader runner",
+    "check": "npm run build && npm test",
     "preview": "vite preview",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "tauri": "tauri"
@@ -20,6 +22,7 @@
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "vitest": "^3.2.4",
     "typescript": "~5.8.3",
     "vite": "^7.0.4",
     "@tauri-apps/cli": "^2"

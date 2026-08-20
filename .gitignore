@@ -11,15 +11,64 @@ node_modules
 dist
 dist-ssr
 src-tauri/target
+
+# Local application state
 *.local
+*.env
+.env
+.env.local
+.env.development.local
+.env.production.local
+.env.test.local
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
+src-tauri/*.db
+src-tauri/*.sqlite
+src-tauri/*.sqlite3
+src-tauri/*.db-shm
+src-tauri/*.db-wal
+src-tauri/*.db-journal
+src-tauri/*.sqlite-shm
+src-tauri/*.sqlite-wal
+src-tauri/*.sqlite-journal
+# Keep sanitized sample databases under examples/ trackable.
+!examples/
+!examples/**
+src-tauri/target/**/bundle/
+src-tauri/target/**/bundle-debug/
+src-tauri/target/**/bundle/release/
+src-tauri/target/**/bundle/debug/
+
+# Generated platform caches
+.vite/
+.turbo/
+.parcel-cache/
+.next/
+.svelte-kit/
+coverage/
+
+# Agent planning and review state
+/.superpowers/
 
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
 .idea
 .DS_Store
+Thumbs.db
+Desktop.ini
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+*.swp
+*.swo
+.worktrees/

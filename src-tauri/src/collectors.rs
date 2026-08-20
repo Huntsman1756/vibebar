@@ -1,10 +1,11 @@
 use std::{
     collections::BTreeMap,
     io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -12,22 +13,68 @@ use regex::Regex;
 use serde_json::{Value, json};
 use wait_timeout::ChildExt;
 
-use crate::domain::{ModelUsage, ProviderSnapshot, QuotaWindow, TokenUsage};
+use crate::domain::{ModelQuota, ModelUsage, ProviderSnapshot, QuotaWindow, TokenUsage};
+use crate::identity::{normalize_provider_id, provider_label};
 
 const MAX_COLLECTOR_OUTPUT: u64 = 8 * 1024 * 1024;
+const OPENCODE_COLLECTOR_TIMEOUT: Duration = Duration::from_secs(5);
+const CODEX_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn codex_handshake_deadline(started: Instant) -> Instant {
+    started + CODEX_HANDSHAKE_TIMEOUT
+}
+
+fn remaining_codex_timeout(deadline: Instant, now: Instant) -> Option<Duration> {
+    deadline.checked_duration_since(now)
+}
+
+fn resolve_program(program: &str) -> PathBuf {
+    let mut candidates = Vec::new();
+    let program_path = Path::new(program);
+    if program_path.is_absolute() {
+        candidates.push(program_path.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|directory| directory.join(program)));
+    }
+    if let Some(home) = dirs::home_dir() {
+        for directory in [".local/bin", ".cargo/bin", ".bun/bin", "bin"] {
+            candidates.push(home.join(directory).join(program));
+        }
+        #[cfg(target_os = "macos")]
+        candidates.push(
+            home.join("Applications/ChatGPT.app/Contents/Resources")
+                .join(program),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        candidates
+            .push(PathBuf::from("/Applications/ChatGPT.app/Contents/Resources").join(program));
+    }
+    for directory in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        candidates.push(Path::new(directory).join(program));
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from(program))
+}
 
 fn fixed_command(program: &str, args: &[&str]) -> Command {
+    let executable = resolve_program(program);
     #[cfg(target_os = "windows")]
     {
         let mut command = Command::new("cmd");
-        command.args(["/D", "/S", "/C", program]);
+        command.args(["/D", "/S", "/C"]);
+        command.arg(executable);
         command.args(args);
         sanitize_environment(&mut command);
         command
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let mut command = Command::new(program);
+        let mut command = Command::new(executable);
         command.args(args);
         sanitize_environment(&mut command);
         command
@@ -86,17 +133,14 @@ fn bounded_output(program: &str, args: &[&str], timeout: Duration) -> Result<Str
         return Err(format!("{program} collector output exceeded 8 MiB"));
     }
     if !status.success() {
-        let message = stderr
-            .lines()
-            .last()
-            .unwrap_or("collector exited unsuccessfully");
-        return Err(format!("{program}: {message}"));
+        return Err(format!("{program} collector exited unsuccessfully"));
     }
     Ok(stdout)
 }
 
 fn parse_human_number(value: &str) -> Option<u64> {
-    let value = value.trim().trim_start_matches('$');
+    let normalized = value.trim().trim_start_matches('$').replace(',', "");
+    let value = normalized.as_str();
     let (number, multiplier) = match value.chars().last()? {
         'K' => (&value[..value.len() - 1], 1_000f64),
         'M' => (&value[..value.len() - 1], 1_000_000f64),
@@ -120,7 +164,7 @@ fn parse_human_number(value: &str) -> Option<u64> {
 pub fn parse_opencode_stats(output: &str) -> Result<Vec<ProviderSnapshot>, String> {
     let ansi = Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").map_err(|_| "invalid ANSI parser")?;
     let field = Regex::new(
-        r"^(Messages|Input Tokens|Output Tokens|Cache Read|Cache Write)\s+([0-9.]+[KMB]?)$",
+        r"^(Messages|Input Tokens|Output Tokens|Cache Read|Cache Write)\s+([0-9.,]+[KMB]?)$",
     )
     .map_err(|_| "invalid stats parser")?;
     let cleaned = ansi.replace_all(output, "");
@@ -130,21 +174,22 @@ pub fn parse_opencode_stats(output: &str) -> Result<Vec<ProviderSnapshot>, Strin
         let line = raw.trim().trim_matches('│').trim();
         if line.contains('/') && !line.contains(' ') && !line.starts_with("http") {
             if let Some((provider, model)) = line.split_once('/') {
-                current = Some((provider.to_lowercase(), model.to_string()));
+                current = Some((normalize_provider_id(provider), model.to_string()));
                 usages
-                    .entry((provider.to_lowercase(), model.to_string()))
+                    .entry((normalize_provider_id(provider), model.to_string()))
                     .or_insert(ModelUsage {
                         model: model.to_string(),
                         calls: 0,
                         tokens: TokenUsage {
                             input_tokens: 0,
                             output_tokens: 0,
+                            reasoning_tokens: 0,
                             cache_read_tokens: 0,
                             cache_write_tokens: 0,
                         },
                         quota_tokens: quota_for(provider, model),
-                        quota_label: quota_for(provider, model)
-                            .map(|_| "documented monthly allowance".into()),
+                        quota_label: quota_label_for(provider, model),
+                        quota_windows: Vec::new(),
                     });
             }
             continue;
@@ -168,6 +213,9 @@ pub fn parse_opencode_stats(output: &str) -> Result<Vec<ProviderSnapshot>, Strin
             _ => {}
         }
     }
+    for ((provider, model), usage) in &mut usages {
+        usage.quota_windows = allowance_windows_for(provider, model);
+    }
     if usages.is_empty() {
         return Err("OpenCode returned no model usage".into());
     }
@@ -179,7 +227,19 @@ pub fn parse_opencode_stats(output: &str) -> Result<Vec<ProviderSnapshot>, Strin
     Ok(grouped
         .into_iter()
         .map(|(provider, mut models)| {
-            models.sort_by_key(|model| std::cmp::Reverse(model.tokens.total()));
+            models.sort_by(|left, right| {
+                right
+                    .tokens
+                    .primary()
+                    .cmp(&left.tokens.primary())
+                    .then_with(|| {
+                        right
+                            .tokens
+                            .observed_total()
+                            .cmp(&left.tokens.observed_total())
+                    })
+                    .then_with(|| left.model.cmp(&right.model))
+            });
             let calls = models.iter().map(|model| model.calls).sum();
             let tokens = sum_tokens(models.iter().map(|model| &model.tokens));
             ProviderSnapshot {
@@ -205,26 +265,67 @@ fn quota_for(provider: &str, model: &str) -> Option<u64> {
     ) {
         ("nan", "deepseek-v4-flash") => Some(500_000_000),
         ("nan", "mimo-v2.5") => Some(1_000_000_000),
+        ("nan", "glm5.2") => Some(3_000_000_000),
         _ => None,
     }
 }
 
-fn provider_label(provider: &str) -> String {
-    match provider {
-        "nan" => "NaN".into(),
-        "openai" => "OpenAI via OpenCode".into(),
-        "anthropic" => "Anthropic via OpenCode".into(),
-        other => other
-            .split(['-', '_'])
-            .map(|part| {
-                let mut chars = part.chars();
-                chars
-                    .next()
-                    .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-                    .unwrap_or_default()
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
+fn quota_label_for(provider: &str, model: &str) -> Option<String> {
+    match (
+        provider.to_ascii_lowercase().as_str(),
+        model.to_ascii_lowercase().as_str(),
+    ) {
+        ("nan", "deepseek-v4-flash") | ("nan", "mimo-v2.5") => {
+            Some("documented monthly allowance".into())
+        }
+        ("nan", "glm5.2") => Some("documented billing-period allowance".into()),
+        _ => None,
+    }
+}
+
+pub fn allowance_windows_for(provider: &str, model: &str) -> Vec<ModelQuota> {
+    let published_unmetered_window =
+        |label: &str, quota_tokens: u64, period_label: &str| ModelQuota {
+            label: label.into(),
+            quota_tokens,
+            used_percent: None,
+            remaining_percent: None,
+            resets_at: None,
+            duration_minutes: None,
+            period_label: period_label.into(),
+        };
+    match (
+        provider.to_ascii_lowercase().as_str(),
+        model.to_ascii_lowercase().as_str(),
+    ) {
+        ("nan", "deepseek-v4-flash") => vec![published_unmetered_window(
+            "Monthly",
+            500_000_000,
+            "Published monthly allowance; local 30-day source cannot meter this window",
+        )],
+        ("nan", "mimo-v2.5") => vec![published_unmetered_window(
+            "Monthly",
+            1_000_000_000,
+            "Published monthly allowance; local 30-day source cannot meter this window",
+        )],
+        ("nan", "glm5.2") => vec![
+            published_unmetered_window(
+                "Billing period",
+                3_000_000_000,
+                "Published billing-period allowance; local 30-day source cannot meter this window",
+            ),
+            ModelQuota {
+                label: "Rolling 4h".into(),
+                quota_tokens: 400_000_000,
+                used_percent: None,
+                remaining_percent: None,
+                resets_at: None,
+                duration_minutes: Some(240),
+                period_label: "Published limit; local 30-day source cannot meter this window"
+                    .into(),
+            },
+        ],
+        _ => Vec::new(),
     }
 }
 
@@ -233,12 +334,14 @@ fn sum_tokens<'a>(tokens: impl Iterator<Item = &'a TokenUsage>) -> TokenUsage {
         TokenUsage {
             input_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         },
         |mut total, item| {
             total.input_tokens = total.input_tokens.saturating_add(item.input_tokens);
             total.output_tokens = total.output_tokens.saturating_add(item.output_tokens);
+            total.reasoning_tokens = total.reasoning_tokens.saturating_add(item.reasoning_tokens);
             total.cache_read_tokens = total
                 .cache_read_tokens
                 .saturating_add(item.cache_read_tokens);
@@ -254,9 +357,43 @@ pub fn collect_opencode() -> Result<Vec<ProviderSnapshot>, String> {
     let output = bounded_output(
         "opencode",
         &["stats", "--pure", "--days", "30", "--models"],
-        Duration::from_secs(25),
+        opencode_collector_timeout(),
     )?;
     parse_opencode_stats(&output)
+}
+
+pub(crate) fn opencode_collector_timeout() -> Duration {
+    OPENCODE_COLLECTOR_TIMEOUT
+}
+
+pub(crate) fn opencode_database_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(xdg_data_home) = std::env::var_os("XDG_DATA_HOME") {
+        candidates.push(PathBuf::from(xdg_data_home).join("opencode/opencode.db"));
+    }
+    if let Some(data_dir) = dirs::data_dir() {
+        candidates.push(data_dir.join("opencode/opencode.db"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local/share/opencode/opencode.db"));
+        candidates.push(home.join("Library/Application Support/opencode/opencode.db"));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+pub(crate) fn opencode_model_identity(raw_model: &str) -> (String, String) {
+    if let Ok(value) = serde_json::from_str::<Value>(raw_model) {
+        let provider = value
+            .get("providerID")
+            .and_then(Value::as_str)
+            .unwrap_or("opencode");
+        let model = value.get("id").and_then(Value::as_str).unwrap_or(raw_model);
+        return (normalize_provider_id(provider), model.to_string());
+    }
+    raw_model
+        .split_once('/')
+        .map(|(provider, model)| (normalize_provider_id(provider), model.to_string()))
+        .unwrap_or_else(|| (normalize_provider_id("opencode"), raw_model.into()))
 }
 
 fn parse_window(label: &str, value: Option<&Value>) -> Option<QuotaWindow> {
@@ -303,6 +440,7 @@ pub fn parse_codex_rate_limits(response: &Value) -> Result<ProviderSnapshot, Str
         tokens: TokenUsage {
             input_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         },
@@ -323,31 +461,65 @@ pub fn collect_codex_rate_limits() -> Result<ProviderSnapshot, String> {
     let mut stdin = child.stdin.take().ok_or("Codex stdin unavailable")?;
     let stdout = child.stdout.take().ok_or("Codex stdout unavailable")?;
     let initialize = json!({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "vibebar", "title": "VibeBar", "version": env!("CARGO_PKG_VERSION")}}});
+    let initialized = json!({"method": "initialized"});
     let request = json!({"id": 2, "method": "account/rateLimits/read"});
-    writeln!(stdin, "{initialize}").map_err(|_| "cannot initialize Codex app-server")?;
-    writeln!(stdin, "{request}").map_err(|_| "cannot request Codex rate limits")?;
-    stdin.flush().map_err(|_| "cannot flush Codex request")?;
-    drop(stdin);
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let bounded = BufReader::new(stdout).take(MAX_COLLECTOR_OUTPUT);
         for line in BufReader::new(bounded).lines().map_while(Result::ok) {
-            if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                if value.get("id").and_then(Value::as_i64) == Some(2) {
-                    let _ = sender.send(value);
-                    break;
-                }
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && sender.send(value).is_err()
+            {
+                break;
             }
         }
     });
-    let response = match receiver.recv_timeout(Duration::from_secs(10)) {
-        Ok(response) => response,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("Codex rate-limit request timed out".into());
+    let deadline = codex_handshake_deadline(Instant::now());
+
+    let receive_response = |expected_id: i64, timeout_message: &str| -> Result<Value, String> {
+        loop {
+            let timeout = remaining_codex_timeout(deadline, Instant::now())
+                .ok_or_else(|| timeout_message.to_string())?;
+            match receiver.recv_timeout(timeout) {
+                Ok(response) if response.get("id").and_then(Value::as_i64) == Some(expected_id) => {
+                    return Ok(response);
+                }
+                Ok(_) => {}
+                Err(_) => return Err(timeout_message.into()),
+            }
         }
     };
+
+    writeln!(stdin, "{initialize}").map_err(|_| "cannot initialize Codex app-server")?;
+    stdin
+        .flush()
+        .map_err(|_| "cannot flush Codex initialize request")?;
+    let initialize_response = match receive_response(1, "Codex initialization request timed out") {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    if let Some(error) = initialize_response.get("error") {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("Codex app-server rejected initialize: {error}"));
+    }
+
+    writeln!(stdin, "{initialized}").map_err(|_| "cannot initialize Codex app-server")?;
+    writeln!(stdin, "{request}").map_err(|_| "cannot request Codex rate limits")?;
+    stdin.flush().map_err(|_| "cannot flush Codex request")?;
+    let response = match receive_response(2, "Codex rate-limit request timed out") {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
     if let Some(error) = response.get("error") {
@@ -371,6 +543,7 @@ pub fn unavailable_provider(
         tokens: TokenUsage {
             input_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         },
@@ -384,6 +557,166 @@ pub fn unavailable_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    static ENVIRONMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn finds_opencode_in_user_local_bin_without_shell_path() {
+        use std::{
+            env, fs,
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let _guard = ENVIRONMENT_LOCK.lock().unwrap();
+        let test_home = env::temp_dir().join(format!(
+            "vibebar-collector-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin_dir = test_home.join(".local/bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let executable = bin_dir.join("opencode");
+        fs::write(&executable, "#!/bin/sh\nprintf 'resolved\\n'\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let old_home = env::var_os("HOME");
+        let old_path = env::var_os("PATH");
+        unsafe {
+            env::set_var("HOME", &test_home);
+            env::set_var("PATH", "/usr/bin:/bin");
+        }
+        let result = fixed_command("opencode", &[]).output();
+        unsafe {
+            match old_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+            match old_path {
+                Some(value) => env::set_var("PATH", value),
+                None => env::remove_var("PATH"),
+            }
+        }
+        let _ = fs::remove_dir_all(&test_home);
+
+        let output = result.expect("opencode should resolve from the user-local fallback");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "resolved\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collector_failure_does_not_expose_stderr() {
+        use std::{
+            env, fs,
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let _guard = ENVIRONMENT_LOCK.lock().unwrap();
+        let test_root = env::temp_dir().join(format!(
+            "vibebar-collector-stderr-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&test_root).unwrap();
+        let executable = test_root.join("vibebar-error-test");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf 'private-token-marker-should-not-leak\\n' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let old_path = env::var_os("PATH");
+        unsafe {
+            env::set_var("PATH", &test_root);
+        }
+        let result = bounded_output("vibebar-error-test", &[], Duration::from_secs(1));
+        unsafe {
+            match old_path {
+                Some(value) => env::set_var("PATH", value),
+                None => env::remove_var("PATH"),
+            }
+        }
+        let _ = fs::remove_dir_all(&test_root);
+
+        assert_eq!(
+            result.unwrap_err(),
+            "vibebar-error-test collector exited unsuccessfully"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completes_codex_handshake_before_rate_limit_request() {
+        use std::{
+            env, fs,
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let _guard = ENVIRONMENT_LOCK.lock().unwrap();
+        let test_root = env::temp_dir().join(format!(
+            "vibebar-codex-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&test_root).unwrap();
+        let executable = test_root.join("codex");
+        fs::write(
+            &executable,
+            r##"#!/bin/sh
+initialized=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"test","codexHome":"/tmp","platformFamily":"unix","platformOs":"macos"}}' ;;
+    *'"method":"initialized"'*) initialized=1 ;;
+    *'"method":"account/rateLimits/read"'*)
+      if [ "$initialized" -eq 1 ]; then
+        printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":12,"resetsAt":100,"windowDurationMins":60},"secondary":{"usedPercent":34,"resetsAt":200,"windowDurationMins":10080},"rateLimitReachedType":null}}}'
+      else
+        printf '%s\n' '{"id":2,"error":{"code":-32000,"message":"not initialized"}}'
+      fi
+      ;;
+  esac
+done
+"##,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let old_path = env::var_os("PATH");
+        unsafe {
+            env::set_var("PATH", &test_root);
+        }
+        let result = collect_codex_rate_limits();
+        unsafe {
+            match old_path {
+                Some(value) => env::set_var("PATH", value),
+                None => env::remove_var("PATH"),
+            }
+        }
+        let _ = fs::remove_dir_all(&test_root);
+
+        let provider = result.expect("Codex rate limits should be available after initialization");
+        assert_eq!(provider.windows.len(), 2);
+        assert_eq!(provider.windows[0].used_percent, 12);
+    }
 
     #[test]
     fn parses_opencode_models_without_mixing_providers() {
@@ -407,11 +740,95 @@ mod tests {
     }
 
     #[test]
+    fn parses_opencode_models_ranks_by_primary_with_observed_total_tiebreak() {
+        let input = "│ nan/primary-tie-plain │\n│  Input Tokens 100 │\n│ nan/primary-tie-cache │\n│  Input Tokens 100 │\n│  Cache Read 50 │\n│ nan/cache-heavy │\n│  Input Tokens 1 │\n│  Cache Read 500 │";
+
+        let providers = parse_opencode_stats(input).unwrap();
+        let nan = providers
+            .iter()
+            .find(|provider| provider.id == "nan")
+            .unwrap();
+
+        assert_eq!(
+            nan.models
+                .iter()
+                .map(|model| model.model.as_str())
+                .collect::<Vec<_>>(),
+            ["primary-tie-cache", "primary-tie-plain", "cache-heavy"]
+        );
+    }
+
+    #[test]
+    fn parses_opencode_message_counts_with_comma_thousands_separator() {
+        let input = "│ nan/qwen3.6 │\n│  Messages 4,253 │\n│  Input Tokens 59.8M │\n│  Output Tokens 4.7M │";
+
+        let providers = parse_opencode_stats(input).unwrap();
+
+        assert_eq!(providers[0].calls, 4_253);
+        assert_eq!(providers[0].models[0].calls, 4_253);
+    }
+
+    #[test]
     fn parses_codex_windows_from_v2_response() {
         let response = json!({"id": 2, "result": {"rateLimits": {"primary": {"usedPercent": 28, "resetsAt": 123, "windowDurationMins": 300}, "secondary": {"usedPercent": 61, "resetsAt": 456, "windowDurationMins": 10080}, "rateLimitReachedType": null}}});
         let provider = parse_codex_rate_limits(&response).unwrap();
         assert_eq!(provider.windows.len(), 2);
         assert_eq!(provider.windows[0].used_percent, 28);
         assert_eq!(provider.status, "ok");
+    }
+
+    #[test]
+    fn nan_allowance_windows_remain_present_but_unmetered() {
+        let deepseek = allowance_windows_for("nan", "deepseek-v4-flash");
+        assert_eq!(deepseek.len(), 1);
+        assert_eq!(deepseek[0].label, "Monthly");
+        assert_eq!(deepseek[0].quota_tokens, 500_000_000);
+        assert_eq!(deepseek[0].used_percent, None);
+        assert_eq!(deepseek[0].remaining_percent, None);
+
+        let mimo = allowance_windows_for("nan", "mimo-v2.5");
+        assert_eq!(mimo.len(), 1);
+        assert_eq!(mimo[0].label, "Monthly");
+        assert_eq!(mimo[0].quota_tokens, 1_000_000_000);
+        assert_eq!(mimo[0].used_percent, None);
+        assert_eq!(mimo[0].remaining_percent, None);
+
+        let glm = allowance_windows_for("nan", "glm5.2");
+        assert_eq!(glm.len(), 2);
+        assert_eq!(glm[0].label, "Billing period");
+        assert_eq!(glm[0].quota_tokens, 3_000_000_000);
+        assert_eq!(glm[0].used_percent, None);
+        assert_eq!(glm[0].remaining_percent, None);
+        assert_eq!(glm[1].label, "Rolling 4h");
+        assert_eq!(glm[1].quota_tokens, 400_000_000);
+        assert_eq!(glm[1].used_percent, None);
+        assert_eq!(glm[1].remaining_percent, None);
+    }
+
+    #[test]
+    fn nan_models_without_published_quota_have_no_quota_windows() {
+        assert!(allowance_windows_for("nan", "qwen3.6").is_empty());
+        assert!(allowance_windows_for("nan", "gemma4").is_empty());
+    }
+
+    #[test]
+    fn opencode_stats_timeout_stays_user_responsive() {
+        assert_eq!(opencode_collector_timeout(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn codex_handshake_uses_one_overall_deadline_for_all_responses() {
+        let started = Instant::now();
+        let deadline = codex_handshake_deadline(started);
+
+        assert_eq!(deadline.duration_since(started), Duration::from_secs(10));
+        assert_eq!(
+            remaining_codex_timeout(deadline, started + Duration::from_secs(7)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            remaining_codex_timeout(deadline, started + Duration::from_secs(11)),
+            None
+        );
     }
 }
