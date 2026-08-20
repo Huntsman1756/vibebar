@@ -5,6 +5,15 @@ import "./App.css";
 import { POPOVER_OPENED_EVENT, shouldAutoRefreshOnMount, shouldUseDemoFallback } from "./appRuntime";
 import { demoSnapshot } from "./demo";
 import {
+  ContributorList,
+  DecisionStrip,
+  EfficiencyPanel,
+  PriceTableEditor,
+  diagnosticForProvider,
+  type ContributorItem,
+} from "./UsageInsights";
+import { rankByPrimary, type LocalPriceTable } from "./efficiency";
+import {
   aggregateHistoryByAgent,
   aggregateHistoryByProvider,
   aggregateHistoryByProviderTotals,
@@ -15,6 +24,7 @@ import {
   sanitizeRepositoryIdentifier,
   selectHistoryRows,
 } from "./history";
+import { readPriceTable, writePriceTable } from "./pricing";
 import type {
   AgentHistorySummary,
   DashboardSnapshot,
@@ -48,6 +58,7 @@ const cacheTokens = (tokens: { cacheReadTokens: number; cacheWriteTokens: number
 const observedTokens = (tokens: { inputTokens: number; outputTokens: number; reasoningTokens?: number; cacheReadTokens: number; cacheWriteTokens: number }) =>
   tokens.inputTokens + tokens.outputTokens + reasoningTokens(tokens) + tokens.cacheReadTokens + tokens.cacheWriteTokens;
 const quotaPercent = (value: number | null) => value == null ? "—" : `${value.toFixed(value < 10 ? 1 : 0)}%`;
+const formatRatioPercent = (value: number | null) => value == null ? "—" : percent.format(value);
 const localUnmeasurableQuotaLabel = "Cuota no medible con datos locales";
 
 export const hasCompleteQuotaMeter = (quota: Pick<ModelQuota, "usedPercent" | "remainingPercent">) =>
@@ -182,14 +193,17 @@ function AgentUsagePanel({ usage }: { usage: typeof demoSnapshot.agentUsage }) {
   </section>;
 }
 
-function CompactProviderCard({ provider }: { provider: ProviderSnapshot }) {
+function CompactProviderCard({ provider, rows }: { provider: ProviderSnapshot; rows: UsageHistoryRow[] }) {
   const observed = observedTokens(provider.tokens);
   const primary = primaryTokens(provider.tokens);
+  const providerMetrics = diagnosticForProvider(rows, provider.id);
+  const providerModels = aggregateHistoryByProvider(rows.filter((row) => row.provider === provider.id));
+  const topModel = providerModels[0];
   return <article className={`compact-provider ${provider.status === "error" ? "provider-error" : ""}`}>
     <header><div className={`provider-mark ${provider.id === "nan" ? "nan" : "chatgpt"}`}>{provider.id === "nan" ? "N" : "✦"}</div><div className="provider-heading"><h3>{provider.label}</h3><span>{provider.source}</span></div><span className={`status-badge ${provider.status}`}><i />{provider.status}</span></header>
     {provider.error ? <p className="provider-error-copy">{provider.error}</p> : null}
     {provider.windows.length > 0 ? <div className="compact-window-grid">{provider.windows.map((window) => <WindowMeter key={window.label} window={window} />)}</div> : null}
-    {provider.models.length > 0 ? <><div className="compact-provider-total"><strong>{formatTokens(observed)}</strong><span>observed · {formatTokens(primary)} Primary (input + output) · {formatTokens(provider.tokens.inputTokens)} input · {formatTokens(provider.tokens.outputTokens)} output · {formatTokens(reasoningTokens(provider.tokens))} reasoning · {formatTokens(provider.tokens.cacheReadTokens)} cache read · {formatTokens(provider.tokens.cacheWriteTokens)} cache write · {compact.format(provider.calls)} calls</span></div><div className="compact-model-list">{provider.models.slice(0, 3).map((model) => { const quota = model.quotaWindows.find((item) => hasCompleteQuotaMeter(item)) ?? model.quotaWindows[0]; return <div className="compact-model" key={model.model}><div><strong>{model.model}</strong><small>{compact.format(model.calls)} calls · {formatTokens(observedTokens(model.tokens))} observed</small><small>{formatTokens(primaryTokens(model.tokens))} Primary (input + output)</small><small>{formatTokens(model.tokens.inputTokens)} input · {formatTokens(model.tokens.outputTokens)} output · {formatTokens(reasoningTokens(model.tokens))} reasoning · {formatTokens(model.tokens.cacheReadTokens)} cache read · {formatTokens(model.tokens.cacheWriteTokens)} cache write</small></div><span>{quota ? hasCompleteQuotaMeter(quota) ? `${quotaPercent(quota.remainingPercent)} left` : localUnmeasurableQuotaLabel : "Sin cuota conocida"}</span></div>; })}</div></> : <p className="compact-empty">{provider.id === "chatgpt-codex" ? "Subscription windows only; token totals are not exposed by Codex." : "No model traffic available."}</p>}
+    {provider.models.length > 0 || providerModels.length > 0 ? <><div className="compact-provider-total"><strong>{rows.length > 0 ? formatTokens(providerMetrics.primaryTokens) : formatTokens(observed)}</strong><span>{rows.length > 0 ? `Primary traffic · ${formatTokens(providerMetrics.reasoningTokens)} reasoning · ${formatRatioPercent(providerMetrics.cacheReuse)} cache reuse` : `observed · ${formatTokens(primary)} Primary (input + output) · ${formatTokens(provider.tokens.inputTokens)} input · ${formatTokens(provider.tokens.outputTokens)} output · ${formatTokens(reasoningTokens(provider.tokens))} reasoning · ${formatTokens(provider.tokens.cacheReadTokens)} cache read · ${formatTokens(provider.tokens.cacheWriteTokens)} cache write · ${compact.format(provider.calls)} calls`}</span></div><div className="compact-provider-signals"><span>Cache reuse <strong>{formatRatioPercent(providerMetrics.cacheReuse)}</strong></span><span>Reasoning <strong>{formatTokens(providerMetrics.reasoningTokens)}</strong></span><span>Top model <strong>{topModel?.model ?? provider.models[0]?.model ?? "—"}</strong></span></div><div className="compact-model-list">{provider.models.slice(0, 3).map((model) => { const quota = model.quotaWindows.find((item) => hasCompleteQuotaMeter(item)) ?? model.quotaWindows[0]; return <div className="compact-model" key={model.model}><div><strong>{model.model}</strong><small>{compact.format(model.calls)} calls · {formatTokens(observedTokens(model.tokens))} observed</small><small>{formatTokens(primaryTokens(model.tokens))} Primary (input + output)</small><small>{formatTokens(model.tokens.inputTokens)} input · {formatTokens(model.tokens.outputTokens)} output · {formatTokens(reasoningTokens(model.tokens))} reasoning · {formatTokens(model.tokens.cacheReadTokens)} cache read · {formatTokens(model.tokens.cacheWriteTokens)} cache write</small></div><span>{quota ? hasCompleteQuotaMeter(quota) ? `${quotaPercent(quota.remainingPercent)} left` : localUnmeasurableQuotaLabel : "Sin cuota conocida"}</span></div>; })}</div></> : <p className="compact-empty">{provider.id === "chatgpt-codex" ? "Subscription windows only; token totals are not exposed by Codex." : "No model traffic available."}</p>}
   </article>;
 }
 
@@ -381,36 +395,7 @@ function HistoryPanel({ snapshot, providerLabels, range, onRangeChange }: { snap
   </section>;
 }
 
-function CompactHistorySummary({ snapshot, providerLabels, range, onRangeChange }: { snapshot: DashboardSnapshot | null; providerLabels: Map<string, string>; range: HistoryRange; onRangeChange: (value: HistoryRange) => void }) {
-  const history = snapshot?.usageHistory ?? null;
-  const localToday = useMemo(() => toLocalIsoDay(snapshot ? new Date(snapshot.generatedAt) : new Date()), [snapshot]);
-  const rows = useMemo(() => history ? selectHistoryRows(history.rows, range, localToday) : [], [history, localToday, range]);
-  const totals = useMemo(() => summarizeHistoryRows(rows), [rows]);
-  const providers = useMemo(() => aggregateHistoryByProviderTotals(rows).slice(0, 3), [rows]);
-  const repositories = useMemo(() => aggregateHistoryByRepository(rows).slice(0, 3), [rows]);
-  const hasSessionFallback = rows.some((row) => row.sourceFidelity === "session-fallback");
-  const unavailable = Boolean(history && isHistoryUnavailable(history));
-  const empty = Boolean(history && !unavailable && rows.length === 0);
-
-  return <section className="compact-history">
-    <div className="compact-section-head"><span>HISTORICAL USAGE</span><small>{historyRangeLabel(range)}</small></div>
-    <HistoryRangeButtons value={range} onChange={onRangeChange} compact />
-    {!history ? <p className="compact-empty">Loading local history…</p> : unavailable ? <p className="compact-empty">Historical usage is unavailable right now.</p> : empty ? <p className="compact-empty">No history rows for this period yet.</p> : <>
-      <div className="compact-history-total"><strong>{formatTokens(totals.observedTokens)}</strong><span>observed · {formatTokens(totals.billableTokens)} Primary (input + output) · {formatTokens(totals.inputTokens)} input · {formatTokens(totals.outputTokens)} output · {formatTokens(totals.reasoningTokens)} reasoning · {formatTokens(totals.cacheReadTokens)} cache read · {formatTokens(totals.cacheWriteTokens)} cache write · {compact.format(totals.messages)} msgs · {compact.format(totals.sessions)} sessions</span></div>
-      <div className="compact-mini-group">
-        <div className="compact-mini-head"><span>Top providers</span><small>{providers.length} shown</small></div>
-        <div className="compact-mini-list">{providers.map((provider) => <div className="compact-mini-row" key={provider.provider}><strong>{providerLabel(provider.provider, providerLabels)}</strong><small>{provider.models.join(" · ")}</small><span>{formatTokens(provider.observedTokens)} observed</span><small>{formatTokens(provider.billableTokens)} Primary (input + output)</small><small>{formatTokens(provider.inputTokens)} input · {formatTokens(provider.outputTokens)} output · {formatTokens(provider.reasoningTokens)} reasoning · {formatTokens(provider.cacheReadTokens)} cache read · {formatTokens(provider.cacheWriteTokens)} cache write</small></div>)}</div>
-      </div>
-      <div className="compact-mini-group">
-        <div className="compact-mini-head"><span>Top repositories</span><small>{repositories.length} shown</small></div>
-        <div className="compact-mini-list">{repositories.map((repository) => <div className="compact-mini-row" key={repository.repository}><strong>{repositoryLabel(repository.repository)}</strong><small>{repository.providers.join(" · ")}</small><span>{formatTokens(repository.observedTokens)} observed</span><small>{formatTokens(repository.billableTokens)} Primary (input + output)</small><small>{formatTokens(repository.inputTokens)} input · {formatTokens(repository.outputTokens)} output · {formatTokens(repository.reasoningTokens)} reasoning · {formatTokens(repository.cacheReadTokens)} cache read · {formatTokens(repository.cacheWriteTokens)} cache write</small></div>)}</div>
-      </div>
-      {hasSessionFallback ? <p className="compact-history-note">Session fallback rows are lower fidelity.</p> : null}
-    </>}
-  </section>;
-}
-
-function PopoverDashboard({
+export function PopoverDashboard({
   snapshot,
   providers,
   loading,
@@ -420,6 +405,7 @@ function PopoverDashboard({
   providerLabels,
   historyRange,
   onHistoryRangeChange,
+  priceTable,
 }: {
   snapshot: DashboardSnapshot | null;
   providers: ProviderSnapshot[];
@@ -430,16 +416,39 @@ function PopoverDashboard({
   providerLabels: Map<string, string>;
   historyRange: HistoryRange;
   onHistoryRangeChange: (value: HistoryRange) => void;
+  priceTable: LocalPriceTable;
 }) {
+  const localToday = useMemo(() => toLocalIsoDay(snapshot ? new Date(snapshot.generatedAt) : new Date()), [snapshot]);
+  const history = snapshot?.usageHistory;
+  const selectedRows = useMemo(() => history ? selectHistoryRows(history.rows, historyRange, localToday) : [], [history, historyRange, localToday]);
+  const baselineRows = history?.rows ?? [];
+  const totals = useMemo(() => summarizeHistoryRows(selectedRows), [selectedRows]);
+  const agentContributors = useMemo<ContributorItem[]>(() => rankByPrimary(aggregateHistoryByAgent(selectedRows)).slice(0, 3).map((item) => ({
+    id: `${item.agent}-${item.provider}-${item.model}-${item.repository}`,
+    label: item.agent,
+    detail: `${providerLabels.get(item.provider) ?? item.provider} · ${item.model} · ${repositoryLabel(item.repository)}`,
+    billableTokens: item.billableTokens,
+    observedTokens: item.observedTokens,
+    share: totals.billableTokens > 0 ? item.billableTokens / totals.billableTokens : null,
+  })), [selectedRows, totals.billableTokens]);
+  const repositoryContributors = useMemo<ContributorItem[]>(() => rankByPrimary(aggregateHistoryByRepository(selectedRows)).slice(0, 3).map((item) => ({
+    id: item.repository,
+    label: repositoryLabel(item.repository),
+    detail: `${item.providers.join(" · ")} · ${item.models.join(" · ")}`,
+    billableTokens: item.billableTokens,
+    observedTokens: item.observedTokens,
+    share: totals.billableTokens > 0 ? item.billableTokens / totals.billableTokens : null,
+  })), [selectedRows, totals.billableTokens]);
   const openFull = () => { void invoke("open_full_dashboard"); };
   return <main className="app-shell popover-shell">
     <header className="popover-header"><div className="brand"><span className="brand-mark"><i /><i /><i /></span><strong>VibeBar</strong><em>local</em></div><div className="popover-actions"><span className="privacy"><i />On-device</span><button className="icon-refresh" onClick={() => void refresh()} disabled={loading} aria-label="Refresh"><span className={loading ? "spin" : ""}>↻</span></button></div></header>
     <div className="popover-content">
       <div className="popover-title"><div><p className="eyebrow">USAGE AT A GLANCE</p><h1>Capacity</h1></div><span>{snapshot ? new Date(snapshot.generatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "Reading…"}</span></div>
       {preview ? <div className="popover-notice">Browser preview · sample data</div> : null}
-      <div className="compact-provider-list">{providers.map((provider) => <CompactProviderCard key={provider.id} provider={provider} />)}{!snapshot ? <div className="compact-provider skeleton" /> : null}</div>
-      <CompactHistorySummary snapshot={snapshot} providerLabels={providerLabels} range={historyRange} onRangeChange={onHistoryRangeChange} />
-      <section className="compact-agents"><div className="compact-section-head"><span>TOP AGENTS / ROLES</span><small>30 days</small></div>{(snapshot?.agentUsage.length ?? 0) === 0 ? <p className="compact-empty">No role token data yet.</p> : <div className="compact-agent-list">{snapshot?.agentUsage.slice(0, 3).map((item) => <div className="compact-agent" key={`${item.agent}-${item.provider}-${item.model}`}><span className="agent-mark">{item.agent.slice(0, 1).toUpperCase()}</span><div><strong>{item.agent}</strong><small>{item.provider} / {item.model}</small><small>{formatTokens(primaryTokens(item.tokens))} Primary (input + output)</small><small>{formatTokens(item.tokens.inputTokens)} input · {formatTokens(item.tokens.outputTokens)} output · {formatTokens(reasoningTokens(item.tokens))} reasoning · {formatTokens(item.tokens.cacheReadTokens)} cache read · {formatTokens(item.tokens.cacheWriteTokens)} cache write</small></div><span className="compact-agent-tokens">{formatTokens(observedTokens(item.tokens))}</span></div>)}</div>}</section>
+      <HistoryRangeButtons value={historyRange} onChange={onHistoryRangeChange} compact />
+      <DecisionStrip rows={selectedRows} baselineRows={baselineRows} rangeLabel={historyRangeLabel(historyRange)} priceTable={priceTable} />
+      <div className="compact-provider-list">{providers.map((provider) => <CompactProviderCard key={provider.id} provider={provider} rows={selectedRows} />)}{!snapshot ? <div className="compact-provider skeleton" /> : null}</div>
+      <div className="compact-contributors"><ContributorList title="Top agents" eyebrow="WHERE IT WENT" items={agentContributors} emptyCopy="Agent attribution appears when assistant-message metadata is available." /><ContributorList title="Top repositories" eyebrow="WHERE IT WENT" items={repositoryContributors} emptyCopy="Repository attribution stays local and is shown only when the source can resolve it." /></div>
       {(snapshot?.diagnostics.length ?? 0) > 0 ? <details className="compact-diagnostics"><summary>{snapshot?.diagnostics.length} source issue(s)</summary>{snapshot?.diagnostics.map((item) => <p key={item}>{item}</p>)}</details> : null}
       {error ? <p className="compact-error">{error}</p> : null}
       <button className="open-dashboard" onClick={openFull}>Open full dashboard <span>↗</span></button>
@@ -451,6 +460,14 @@ function Metric({ label, value, detail, tone }: { label: string; value: string; 
   return <div className="metric"><span>{label}</span><strong className={tone}>{value}</strong><small>{detail}</small></div>;
 }
 
+function localStorageOrNull(): Storage | null {
+  try {
+    return typeof window === "undefined" ? null : window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
 function App() {
   const isPopover = new URLSearchParams(window.location.search).get("view") === "popover";
   const tauriRuntime = isTauri();
@@ -459,6 +476,7 @@ function App() {
   const [preview, setPreview] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [historyRange, setHistoryRange] = useState<HistoryRange>("30d");
+  const [priceTable, setPriceTable] = useState<LocalPriceTable>(() => readPriceTable(localStorageOrNull()));
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -531,9 +549,38 @@ function App() {
     ["chatgpt-codex", "ChatGPT · Codex"],
     ...providers.map((provider) => [provider.id, provider.label] as const),
   ]), [providers]);
+  const historyRows = snapshot?.usageHistory.rows ?? [];
+  const localToday = useMemo(() => toLocalIsoDay(snapshot ? new Date(snapshot.generatedAt) : new Date()), [snapshot]);
+  const selectedHistoryRows = useMemo(() => selectHistoryRows(historyRows, historyRange, localToday), [historyRows, historyRange, localToday]);
+  const selectedTotals = useMemo(() => summarizeHistoryRows(selectedHistoryRows), [selectedHistoryRows]);
+  const selectedAgentContributors = useMemo<ContributorItem[]>(() => rankByPrimary(aggregateHistoryByAgent(selectedHistoryRows)).slice(0, 3).map((item) => ({
+    id: `${item.agent}-${item.provider}-${item.model}-${item.repository}`,
+    label: item.agent,
+    detail: `${providerLabels.get(item.provider) ?? item.provider} · ${item.model} · ${repositoryLabel(item.repository)}`,
+    billableTokens: item.billableTokens,
+    observedTokens: item.observedTokens,
+    share: selectedTotals.billableTokens > 0 ? item.billableTokens / selectedTotals.billableTokens : null,
+  })), [providerLabels, selectedHistoryRows, selectedTotals.billableTokens]);
+  const selectedRepositoryContributors = useMemo<ContributorItem[]>(() => rankByPrimary(aggregateHistoryByRepository(selectedHistoryRows)).slice(0, 3).map((item) => ({
+    id: item.repository,
+    label: repositoryLabel(item.repository),
+    detail: `${item.providers.map((provider) => providerLabels.get(provider) ?? provider).join(" · ")} · ${item.models.join(" · ")}`,
+    billableTokens: item.billableTokens,
+    observedTokens: item.observedTokens,
+    share: selectedTotals.billableTokens > 0 ? item.billableTokens / selectedTotals.billableTokens : null,
+  })), [providerLabels, selectedHistoryRows, selectedTotals.billableTokens]);
+  const modelKeys = useMemo(() => [...new Set(historyRows.map((row) => `${row.provider}\u0000${row.model}`))], [historyRows]);
+  const savePriceTable = useCallback((table: LocalPriceTable) => {
+    setPriceTable(table);
+    writePriceTable(localStorageOrNull(), table);
+  }, []);
+  const clearPriceTable = useCallback(() => {
+    setPriceTable({});
+    writePriceTable(localStorageOrNull(), {});
+  }, []);
 
   if (isPopover) {
-    return <PopoverDashboard snapshot={snapshot} providers={providers} loading={loading} preview={preview} error={error} refresh={refresh} providerLabels={providerLabels} historyRange={historyRange} onHistoryRangeChange={setHistoryRange} />;
+    return <PopoverDashboard snapshot={snapshot} providers={providers} loading={loading} preview={preview} error={error} refresh={refresh} providerLabels={providerLabels} historyRange={historyRange} onHistoryRangeChange={setHistoryRange} priceTable={priceTable} />;
   }
 
   return <main className="app-shell">
@@ -550,14 +597,25 @@ function App() {
     {preview ? <div className="notice"><strong>Browser preview</strong><span>Showing sample data. Live collectors run inside the Tauri app.</span>{error ? <code>{error}</code> : null}</div> : null}
     {!preview && error ? <div className="notice"><strong>Live snapshot unavailable</strong><span>VibeBar could not read the local collectors, so it is not showing invented provider or history values.</span><code>{error}</code></div> : null}
 
+    <section className="overview-panel">
+      <div className="section-head"><div><p className="eyebrow">OVERVIEW</p><h2>Spend, explained</h2></div><HistoryRangeButtons value={historyRange} onChange={setHistoryRange} /></div>
+      <DecisionStrip rows={selectedHistoryRows} baselineRows={historyRows} rangeLabel={historyRangeLabel(historyRange)} priceTable={priceTable} />
+      <EfficiencyPanel rows={selectedHistoryRows} baselineRows={historyRows} priceTable={priceTable} />
+      <PriceTableEditor modelKeys={modelKeys} priceTable={priceTable} onSave={savePriceTable} onClear={clearPriceTable} />
+    </section>
+
     <section className="section-head"><div><p className="eyebrow">LIVE SOURCES</p><h2>Capacity</h2></div><span>Updated {snapshot ? new Date(snapshot.generatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—"}</span></section>
     <section className="provider-grid">{providers.map((provider) => <ProviderCard key={provider.id} provider={provider} />)}{!snapshot && <div className="provider-card skeleton" />}</section>
 
     <HistoryPanel snapshot={snapshot} providerLabels={providerLabels} range={historyRange} onRangeChange={setHistoryRange} />
+    <section className="contributors-grid">
+      <ContributorList title="Largest agent contributors" eyebrow="WHERE IT WENT · AGENTS" items={selectedAgentContributors} emptyCopy="Agent attribution appears when assistant-message metadata is available." />
+      <ContributorList title="Largest repository contributors" eyebrow="WHERE IT WENT · REPOSITORIES" items={selectedRepositoryContributors} emptyCopy="Repository attribution remains local and uses normalized Git remotes." />
+    </section>
     <AgentUsagePanel usage={snapshot?.agentUsage ?? []} />
 
     <section className="outcomes-panel">
-      <div className="section-head compact"><div><p className="eyebrow">ORCHESTRATION QUALITY</p><h2>Outcome, not just spend</h2></div><span>From bounded JSONL events</span></div>
+      <div className="section-head compact"><div><p className="eyebrow">OUTCOME FROM LOCAL EVENTS</p><h2>Outcome, not just spend</h2></div><span>From bounded JSONL events</span></div>
       <div className="metrics-grid">
         <Metric label="Acceptance" value={workflow?.acceptanceRate == null ? "—" : percent.format(workflow.acceptanceRate)} detail={`${workflow?.acceptedTasks ?? 0} of ${workflow?.tasks ?? 0} tasks`} tone="mint-text" />
         <Metric label="Attempts / accepted" value={workflow?.attemptsPerAccepted?.toFixed(2) ?? "—"} detail={`${workflow?.attempts ?? 0} execution attempts`} />
