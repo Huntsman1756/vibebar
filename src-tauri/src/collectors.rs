@@ -550,6 +550,7 @@ pub fn unavailable_provider(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     static ENVIRONMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(unix)]

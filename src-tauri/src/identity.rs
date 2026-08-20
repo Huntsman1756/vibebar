@@ -349,7 +349,7 @@ mod tests {
     };
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn normalizes_and_labels_known_and_unknown_providers() {
@@ -536,6 +536,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolver_does_not_block_on_unresponsive_git_metadata() {
+        use std::time::Duration;
+
         let repo_dir = unique_dir("repository-resolver-blocked-config");
         let git_dir = repo_dir.join(".git");
         fs::create_dir_all(&git_dir).expect("create git dir");
