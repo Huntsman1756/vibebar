@@ -8,7 +8,7 @@ const priceKeys: (keyof ModelPrice)[] = ["input", "output", "reasoning", "cacheR
 function isSafeKey(value: string): boolean {
   return value.length > 0
     && value.length <= 256
-    && !value.replaceAll("\u0000", "").match(/[\u0001-\u001F\u007F]/);
+    && !value.split("\u0000").join("").match(/[\u0001-\u001F\u007F]/);
 }
 
 function isModelPrice(value: unknown): value is ModelPrice {

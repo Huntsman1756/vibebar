@@ -1,4 +1,4 @@
-import type { HistorySourceFidelity, TokenUsage, UsageHistoryRow } from "./types";
+import type { TokenUsage, UsageHistoryRow } from "./types";
 
 export type EfficiencyState = "good" | "watch" | "insufficient";
 export type EfficiencyLabel = "Good signal" | "Watch" | "Insufficient data";
@@ -67,7 +67,7 @@ function tokenTotals(tokens: TokenUsage) {
   return {
     primaryTokens,
     cacheTokens,
-    observedTokens: primaryTokens + tokens.reasoningTokens + cacheTokens,
+    observedTokens: primaryTokens + (tokens.reasoningTokens ?? 0) + cacheTokens,
   };
 }
 
@@ -167,7 +167,7 @@ export function diagnoseEfficiency(rows: UsageHistoryRow[], baselineRows: UsageH
     .map((day) => day.uncachedInputShare)
     .filter((value): value is number => value != null));
   const baselineOldestDay = baselineDays[0]?.day ?? null;
-  const baselineNewestDay = baselineDays.at(-1)?.day ?? null;
+  const baselineNewestDay = baselineDays[baselineDays.length - 1]?.day ?? null;
   const baseline = {
     cacheReuse: baselineCacheReuse,
     uncachedInputShare: baselineUncachedInputShare,
