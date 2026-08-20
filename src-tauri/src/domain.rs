@@ -236,7 +236,6 @@ impl Default for UsageHistory {
 #[serde(rename_all = "camelCase")]
 pub struct DashboardSnapshot {
     pub generated_at: String,
-    pub telemetry_path: String,
     pub providers: Vec<ProviderSnapshot>,
     pub agent_usage: Vec<AgentUsage>,
     #[serde(default)]
@@ -249,6 +248,13 @@ pub struct DashboardSnapshot {
 const USAGE_HISTORY_ROW_LIMIT: usize = 1_000;
 type UsageHistoryAggregateKey = (String, String, String, String, String, String, String);
 
+struct UsageHistoryAccumulator {
+    row: UsageHistoryRow,
+    has_cost: bool,
+    has_unpriced_tokens: bool,
+    total_cost_microusd: u64,
+}
+
 pub fn aggregate_workflow(events: &[UsageEvent]) -> WorkflowMetrics {
     let mut task_states: BTreeMap<&str, bool> = BTreeMap::new();
     let mut attempts = 0u64;
@@ -256,10 +262,19 @@ pub fn aggregate_workflow(events: &[UsageEvent]) -> WorkflowMetrics {
     let mut mechanical_failures = 0u64;
     let mut escalations = 0u64;
     let mut total_cost = 0u64;
+    let mut has_unpriced_tokens = false;
 
     for event in events {
         task_states.entry(&event.task_id).or_insert(false);
-        total_cost = total_cost.saturating_add(event.cost_microusd.unwrap_or(0));
+        if let Some(cost) = event.cost_microusd {
+            total_cost = total_cost.saturating_add(cost);
+        } else if event
+            .tokens
+            .as_ref()
+            .is_some_and(|tokens| tokens.observed_total() > 0)
+        {
+            has_unpriced_tokens = true;
+        }
         match event.kind {
             EventKind::AttemptStarted => attempts = attempts.saturating_add(1),
             EventKind::ReviewAccepted | EventKind::TaskCompleted => {
@@ -287,7 +302,8 @@ pub fn aggregate_workflow(events: &[UsageEvent]) -> WorkflowMetrics {
         reviewer_rejections,
         mechanical_failures,
         escalations,
-        cost_per_accepted_microusd: (accepted_tasks > 0).then(|| total_cost / accepted_tasks),
+        cost_per_accepted_microusd: (accepted_tasks > 0 && !has_unpriced_tokens)
+            .then(|| total_cost / accepted_tasks),
     }
 }
 
@@ -306,7 +322,7 @@ pub fn aggregate_agent_usage(events: &[UsageEvent], since: DateTime<Utc>) -> Vec
                     agent: event.role.clone(),
                     provider: event.provider.clone(),
                     model: event.model.clone(),
-                    source: "vibebar-events-30d".into(),
+                    source: "vibebar-events-90d".into(),
                     calls: 0,
                     tasks: 0,
                     tokens: TokenUsage {
@@ -363,8 +379,14 @@ pub fn aggregate_agent_usage(events: &[UsageEvent], since: DateTime<Utc>) -> Vec
     usage.sort_by(|left, right| {
         right
             .tokens
-            .observed_total()
-            .cmp(&left.tokens.observed_total())
+            .primary()
+            .cmp(&left.tokens.primary())
+            .then_with(|| {
+                right
+                    .tokens
+                    .observed_total()
+                    .cmp(&left.tokens.observed_total())
+            })
             .then_with(|| right.calls.cmp(&left.calls))
             .then_with(|| left.agent.cmp(&right.agent))
             .then_with(|| left.provider.cmp(&right.provider))
@@ -395,8 +417,14 @@ pub fn merge_agent_usage(primary: Vec<AgentUsage>, fallback: Vec<AgentUsage>) ->
     merged.sort_by(|left, right| {
         right
             .tokens
-            .observed_total()
-            .cmp(&left.tokens.observed_total())
+            .primary()
+            .cmp(&left.tokens.primary())
+            .then_with(|| {
+                right
+                    .tokens
+                    .observed_total()
+                    .cmp(&left.tokens.observed_total())
+            })
             .then_with(|| right.calls.cmp(&left.calls))
             .then_with(|| left.agent.cmp(&right.agent))
             .then_with(|| left.provider.cmp(&right.provider))
@@ -406,7 +434,7 @@ pub fn merge_agent_usage(primary: Vec<AgentUsage>, fallback: Vec<AgentUsage>) ->
 }
 
 pub fn aggregate_history_rows(rows: impl IntoIterator<Item = UsageHistoryRow>) -> UsageHistory {
-    let mut grouped: BTreeMap<UsageHistoryAggregateKey, UsageHistoryRow> = BTreeMap::new();
+    let mut grouped: BTreeMap<UsageHistoryAggregateKey, UsageHistoryAccumulator> = BTreeMap::new();
 
     for row in rows {
         let key = (
@@ -418,75 +446,103 @@ pub fn aggregate_history_rows(rows: impl IntoIterator<Item = UsageHistoryRow>) -
             row.source.clone(),
             row.source_fidelity.clone(),
         );
-        let entry = grouped.entry(key).or_insert_with(|| UsageHistoryRow {
-            day: row.day.clone(),
-            repository: row.repository.clone(),
-            agent: row.agent.clone(),
-            provider: row.provider.clone(),
-            model: row.model.clone(),
-            source: row.source.clone(),
-            source_fidelity: row.source_fidelity.clone(),
-            message_count: 0,
-            session_count: 0,
-            tokens: TokenUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-                reasoning_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-            },
-            cost_microusd: None,
-        });
-        entry.message_count = entry.message_count.saturating_add(row.message_count);
-        entry.session_count = entry.session_count.saturating_add(row.session_count);
-        entry.tokens.input_tokens = entry
+        let row_is_token_bearing = row.tokens.observed_total() > 0;
+        let entry = grouped
+            .entry(key)
+            .or_insert_with(|| UsageHistoryAccumulator {
+                row: UsageHistoryRow {
+                    day: row.day.clone(),
+                    repository: row.repository.clone(),
+                    agent: row.agent.clone(),
+                    provider: row.provider.clone(),
+                    model: row.model.clone(),
+                    source: row.source.clone(),
+                    source_fidelity: row.source_fidelity.clone(),
+                    message_count: 0,
+                    session_count: 0,
+                    tokens: TokenUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        reasoning_tokens: 0,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                    },
+                    cost_microusd: None,
+                },
+                has_cost: false,
+                has_unpriced_tokens: false,
+                total_cost_microusd: 0,
+            });
+        entry.row.message_count = entry.row.message_count.saturating_add(row.message_count);
+        entry.row.session_count = entry.row.session_count.saturating_add(row.session_count);
+        entry.row.tokens.input_tokens = entry
+            .row
             .tokens
             .input_tokens
             .saturating_add(row.tokens.input_tokens);
-        entry.tokens.output_tokens = entry
+        entry.row.tokens.output_tokens = entry
+            .row
             .tokens
             .output_tokens
             .saturating_add(row.tokens.output_tokens);
-        entry.tokens.reasoning_tokens = entry
+        entry.row.tokens.reasoning_tokens = entry
+            .row
             .tokens
             .reasoning_tokens
             .saturating_add(row.tokens.reasoning_tokens);
-        entry.tokens.cache_read_tokens = entry
+        entry.row.tokens.cache_read_tokens = entry
+            .row
             .tokens
             .cache_read_tokens
             .saturating_add(row.tokens.cache_read_tokens);
-        entry.tokens.cache_write_tokens = entry
+        entry.row.tokens.cache_write_tokens = entry
+            .row
             .tokens
             .cache_write_tokens
             .saturating_add(row.tokens.cache_write_tokens);
-        entry.cost_microusd = match (entry.cost_microusd, row.cost_microusd) {
-            (Some(left), Some(right)) => Some(left.saturating_add(right)),
-            (Some(left), None) => Some(left),
-            (None, Some(right)) => Some(right),
-            (None, None) => None,
-        };
+        match row.cost_microusd {
+            Some(cost) => {
+                entry.has_cost = true;
+                entry.total_cost_microusd = entry.total_cost_microusd.saturating_add(cost);
+            }
+            None if row_is_token_bearing => entry.has_unpriced_tokens = true,
+            None => {}
+        }
     }
 
     let oldest_day = grouped
         .values()
-        .map(|row| row.day.as_str())
+        .map(|entry| entry.row.day.as_str())
         .min()
         .map(str::to_owned);
     let newest_day = grouped
         .values()
-        .map(|row| row.day.as_str())
+        .map(|entry| entry.row.day.as_str())
         .max()
         .map(str::to_owned);
-    let repository_attribution_enabled = grouped
-        .values()
-        .any(|row| !row.repository.is_empty() && row.repository != REPOSITORY_ATTRIBUTION_DISABLED);
+    let repository_attribution_enabled = grouped.values().any(|entry| {
+        !entry.row.repository.is_empty() && entry.row.repository != REPOSITORY_ATTRIBUTION_DISABLED
+    });
 
-    let mut rows = grouped.into_values().collect::<Vec<_>>();
+    let mut rows = grouped
+        .into_values()
+        .map(|mut entry| {
+            entry.row.cost_microusd =
+                (!entry.has_unpriced_tokens && entry.has_cost).then_some(entry.total_cost_microusd);
+            entry.row
+        })
+        .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
         right
             .tokens
-            .observed_total()
-            .cmp(&left.tokens.observed_total())
+            .primary()
+            .cmp(&left.tokens.primary())
+            .then_with(|| {
+                right
+                    .tokens
+                    .observed_total()
+                    .cmp(&left.tokens.observed_total())
+            })
             .then_with(|| left.day.cmp(&right.day))
             .then_with(|| left.provider.cmp(&right.provider))
             .then_with(|| left.model.cmp(&right.model))
@@ -548,7 +604,7 @@ mod tests {
             agent: spec.agent.into(),
             provider: spec.provider.into(),
             model: spec.model.into(),
-            source: "opencode-db-30d".into(),
+            source: "opencode-db-90d".into(),
             source_fidelity: "message-metadata".into(),
             message_count: spec.message_count,
             session_count: spec.session_count,
@@ -707,23 +763,32 @@ mod tests {
     }
 
     #[test]
-    fn agent_usage_ranks_by_observed_total_instead_of_primary() {
+    fn agent_usage_ranks_by_primary_with_observed_total_tiebreak() {
         let since = Utc::now() - chrono::Duration::days(30);
-        let primary_heavy = token_event(
-            "primary-heavy",
+        let primary_tie_plain = token_event(
+            "primary-tie-plain",
             "primary-task",
-            "primary-heavy",
+            "primary-tie-plain",
             EventKind::AttemptStarted,
             since + chrono::Duration::hours(1),
             100,
             0,
+        );
+        let mut primary_tie_cache = token_event(
+            "primary-tie-cache",
+            "primary-cache-task",
+            "primary-tie-cache",
+            EventKind::AttemptStarted,
+            since + chrono::Duration::hours(2),
+            80,
+            20,
         );
         let mut cache_heavy = token_event(
             "cache-heavy",
             "cache-task",
             "cache-heavy",
             EventKind::AttemptStarted,
-            since + chrono::Duration::hours(2),
+            since + chrono::Duration::hours(3),
             1,
             0,
         );
@@ -732,26 +797,40 @@ mod tests {
             "reasoning-task",
             "reasoning-heavy",
             EventKind::AttemptStarted,
-            since + chrono::Duration::hours(3),
+            since + chrono::Duration::hours(4),
             2,
             0,
         );
+        primary_tie_cache.tokens.as_mut().unwrap().cache_read_tokens = 50;
         cache_heavy.tokens.as_mut().unwrap().cache_read_tokens = 500;
         reasoning_heavy.tokens.as_mut().unwrap().reasoning_tokens = 700;
 
-        let usage = aggregate_agent_usage(&[primary_heavy, cache_heavy, reasoning_heavy], since);
+        let usage = aggregate_agent_usage(
+            &[
+                primary_tie_plain,
+                primary_tie_cache,
+                cache_heavy,
+                reasoning_heavy,
+            ],
+            since,
+        );
 
         assert_eq!(
             usage
                 .iter()
                 .map(|item| item.agent.as_str())
                 .collect::<Vec<_>>(),
-            ["reasoning-heavy", "cache-heavy", "primary-heavy"]
+            [
+                "primary-tie-cache",
+                "primary-tie-plain",
+                "reasoning-heavy",
+                "cache-heavy"
+            ]
         );
-        assert_eq!(usage[0].tokens.primary(), 2);
-        assert_eq!(usage[0].tokens.observed_total(), 702);
-        assert_eq!(usage[1].tokens.primary(), 1);
-        assert_eq!(usage[1].tokens.observed_total(), 501);
+        assert_eq!(usage[0].tokens.primary(), 100);
+        assert_eq!(usage[0].tokens.observed_total(), 150);
+        assert_eq!(usage[1].tokens.primary(), 100);
+        assert_eq!(usage[1].tokens.observed_total(), 100);
     }
 
     #[test]
@@ -760,7 +839,7 @@ mod tests {
             agent: "executor".into(),
             provider: "nan".into(),
             model: "qwen3.6".into(),
-            source: "opencode-db-30d".into(),
+            source: "opencode-db-90d".into(),
             calls: 2,
             tasks: 2,
             tokens: TokenUsage {
@@ -776,7 +855,7 @@ mod tests {
                 agent: "executor".into(),
                 provider: "nan".into(),
                 model: "qwen3.6".into(),
-                source: "vibebar-events-30d".into(),
+                source: "vibebar-events-90d".into(),
                 calls: 99,
                 tasks: 99,
                 tokens: TokenUsage {
@@ -791,7 +870,7 @@ mod tests {
                 agent: "reviewer".into(),
                 provider: "chatgpt".into(),
                 model: "codex".into(),
-                source: "vibebar-events-30d".into(),
+                source: "vibebar-events-90d".into(),
                 calls: 1,
                 tasks: 1,
                 tokens: TokenUsage {
@@ -814,17 +893,17 @@ mod tests {
                 .find(|item| item.agent == "reviewer")
                 .unwrap()
                 .source,
-            "vibebar-events-30d"
+            "vibebar-events-90d"
         );
     }
 
     #[test]
-    fn merged_agent_usage_ranks_by_observed_total_instead_of_primary() {
+    fn merged_agent_usage_ranks_by_primary_with_observed_total_tiebreak() {
         let primary = vec![AgentUsage {
-            agent: "primary-heavy".into(),
+            agent: "primary-tie-plain".into(),
             provider: "nan".into(),
             model: "qwen3.6".into(),
-            source: "opencode-db-30d".into(),
+            source: "opencode-db-90d".into(),
             calls: 1,
             tasks: 1,
             tokens: TokenUsage {
@@ -835,27 +914,52 @@ mod tests {
                 cache_write_tokens: 0,
             },
         }];
-        let fallback = vec![AgentUsage {
-            agent: "cache-heavy".into(),
-            provider: "nan".into(),
-            model: "qwen3.6".into(),
-            source: "vibebar-events-30d".into(),
-            calls: 1,
-            tasks: 1,
-            tokens: TokenUsage {
-                input_tokens: 1,
-                output_tokens: 0,
-                reasoning_tokens: 0,
-                cache_read_tokens: 500,
-                cache_write_tokens: 0,
+        let fallback = vec![
+            AgentUsage {
+                agent: "primary-tie-cache".into(),
+                provider: "nan".into(),
+                model: "qwen3.6".into(),
+                source: "vibebar-events-90d".into(),
+                calls: 1,
+                tasks: 1,
+                tokens: TokenUsage {
+                    input_tokens: 80,
+                    output_tokens: 20,
+                    reasoning_tokens: 0,
+                    cache_read_tokens: 50,
+                    cache_write_tokens: 0,
+                },
             },
-        }];
+            AgentUsage {
+                agent: "cache-heavy".into(),
+                provider: "nan".into(),
+                model: "qwen3.6".into(),
+                source: "vibebar-events-90d".into(),
+                calls: 1,
+                tasks: 1,
+                tokens: TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                    cache_read_tokens: 500,
+                    cache_write_tokens: 0,
+                },
+            },
+        ];
 
         let merged = merge_agent_usage(primary, fallback);
 
-        assert_eq!(merged[0].agent, "cache-heavy");
-        assert_eq!(merged[0].tokens.primary(), 1);
-        assert_eq!(merged[0].tokens.observed_total(), 501);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|item| item.agent.as_str())
+                .collect::<Vec<_>>(),
+            ["primary-tie-cache", "primary-tie-plain", "cache-heavy"]
+        );
+        assert_eq!(merged[0].tokens.primary(), 100);
+        assert_eq!(merged[0].tokens.observed_total(), 150);
+        assert_eq!(merged[1].tokens.primary(), 100);
+        assert_eq!(merged[1].tokens.observed_total(), 100);
     }
 
     #[test]
@@ -875,6 +979,27 @@ mod tests {
         assert_eq!(metrics.mechanical_failures, 1);
         assert_eq!(metrics.escalations, 1);
         assert_eq!(metrics.attempts_per_accepted, Some(2.0));
+    }
+
+    #[test]
+    fn workflow_cost_per_accepted_is_unavailable_for_an_unpriced_token_event() {
+        let mut events = vec![
+            event("1", "task-a", EventKind::AttemptStarted),
+            event("2", "task-a", EventKind::ReviewAccepted),
+        ];
+        events[0].tokens = Some(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 2,
+            reasoning_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        });
+        events[0].cost_microusd = None;
+
+        let metrics = aggregate_workflow(&events);
+
+        assert_eq!(metrics.accepted_tasks, 1);
+        assert_eq!(metrics.cost_per_accepted_microusd, None);
     }
 
     #[test]
@@ -990,10 +1115,45 @@ mod tests {
     }
 
     #[test]
+    fn history_cost_is_unavailable_when_any_token_bearing_row_is_unpriced() {
+        let history = aggregate_history_rows([
+            history_row(HistoryRowSpec {
+                day: "2026-08-16",
+                repository: "github.com/example/alpha",
+                agent: "executor",
+                provider: "nan",
+                model: "qwen3.6",
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                message_count: 1,
+                session_count: 1,
+                cost_microusd: Some(8),
+            }),
+            history_row(HistoryRowSpec {
+                day: "2026-08-16",
+                repository: "github.com/example/alpha",
+                agent: "executor",
+                provider: "nan",
+                model: "qwen3.6",
+                input_tokens: 4,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                message_count: 1,
+                session_count: 1,
+                cost_microusd: None,
+            }),
+        ]);
+
+        assert_eq!(history.rows.len(), 1);
+        assert_eq!(history.rows[0].tokens.primary(), 17);
+        assert_eq!(history.rows[0].cost_microusd, None);
+    }
+
+    #[test]
     fn dashboard_snapshot_serializes_empty_usage_history() {
         let snapshot = DashboardSnapshot {
             generated_at: "2026-08-16T12:00:00Z".into(),
-            telemetry_path: "/tmp/events-v1.jsonl".into(),
             providers: Vec::new(),
             agent_usage: Vec::new(),
             usage_history: UsageHistory::default(),
@@ -1005,6 +1165,23 @@ mod tests {
         let value = serde_json::to_value(snapshot).unwrap();
         assert_eq!(value["usageHistory"]["rows"], serde_json::json!([]));
         assert_eq!(value["usageHistory"]["truncated"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn dashboard_snapshot_serialization_never_exposes_telemetry_path() {
+        let snapshot = DashboardSnapshot {
+            generated_at: "2026-08-16T12:00:00Z".into(),
+            providers: Vec::new(),
+            agent_usage: Vec::new(),
+            usage_history: UsageHistory::default(),
+            workflow: WorkflowMetrics::default(),
+            recent_events: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let value = serde_json::to_value(snapshot).unwrap();
+
+        assert!(value.get("telemetryPath").is_none());
     }
 
     #[test]
@@ -1065,7 +1242,6 @@ mod tests {
     fn dashboard_snapshot_deserializes_missing_usage_history_for_older_payloads() {
         let snapshot = serde_json::from_value::<DashboardSnapshot>(serde_json::json!({
             "generatedAt": "2026-08-16T12:00:00Z",
-            "telemetryPath": "/tmp/events-v1.jsonl",
             "providers": [],
             "agentUsage": [],
             "workflow": {
@@ -1090,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_history_truncates_at_documented_row_limit() {
+    fn usage_history_cap_ranks_primary_then_observed_then_stable_fields() {
         let history = aggregate_history_rows((0..1_001).map(|index| {
             let day = format!("2026-08-{:02}", (index % 28) + 1);
             let repository = format!("github.com/example/repo-{index:04}");
@@ -1100,13 +1276,21 @@ mod tests {
                 agent: "executor",
                 provider: "nan",
                 model: "qwen3.6",
-                input_tokens: if index == 1_000 {
+                input_tokens: if index <= 2 {
+                    10_000
+                } else if index == 1_000 {
                     1
                 } else {
                     10_000_u64.saturating_sub(index as u64)
                 },
                 output_tokens: 0,
-                cache_read_tokens: if index == 1_000 { 20_000 } else { 0 },
+                cache_read_tokens: if index == 1 {
+                    50
+                } else if index == 1_000 {
+                    20_000
+                } else {
+                    0
+                },
                 message_count: 1,
                 session_count: 1,
                 cost_microusd: None,
@@ -1117,9 +1301,15 @@ mod tests {
         assert_eq!(history.rows.len(), USAGE_HISTORY_ROW_LIMIT);
         assert_eq!(
             history.rows.first().map(|row| row.repository.as_str()),
-            Some("github.com/example/repo-1000")
+            Some("github.com/example/repo-0001")
         );
-        assert_eq!(history.rows[0].tokens.primary(), 1);
-        assert_eq!(history.rows[0].tokens.observed_total(), 20_001);
+        assert_eq!(history.rows[1].repository, "github.com/example/repo-0000");
+        assert_eq!(history.rows[2].repository, "github.com/example/repo-0002");
+        assert!(
+            !history
+                .rows
+                .iter()
+                .any(|row| row.repository == "github.com/example/repo-1000")
+        );
     }
 }

@@ -54,6 +54,9 @@ src-tauri/target/**/bundle/debug/
 .svelte-kit/
 coverage/
 
+# Agent planning and review state
+/.superpowers/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

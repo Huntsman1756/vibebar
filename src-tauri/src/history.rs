@@ -1,5 +1,7 @@
 use chrono::{Datelike, Local, NaiveDate, TimeZone, Utc};
 
+pub const RETAINED_HISTORY_DAYS: u64 = 90;
+
 #[allow(
     dead_code,
     reason = "Retained as a shared history-window contract for Rust-side filtering helpers."

@@ -65,15 +65,15 @@ Efficiency diagnostics are derived only from the selected period:
 
 The top-line state is deliberately conservative:
 
-- **Good signal:** enough metadata exists and the selected period is at or better than the user's own 30-day baseline on cache reuse and uncached input share.
-- **Watch:** enough metadata exists and either cache reuse or uncached input share is materially worse than the baseline.
-- **Insufficient data:** no reliable baseline, no primary traffic, or only event/session fallback data for the selected scope.
+- **Good signal:** enough metadata exists and the selected period is at or better than the immediately preceding comparable period on cache reuse and uncached input share.
+- **Watch:** enough metadata exists and either cache reuse or uncached input share is materially worse than the previous comparable period.
+- **Insufficient data:** no reliable comparison period, no primary traffic, or only event/session fallback data for the selected scope.
 
-The baseline is the median of daily values over the available 30-day local series. The state is a diagnostic hint, not a benchmark, and the UI always shows the component measurements and baseline date range beside it.
+The comparison uses the immediately preceding comparable period from the retained 90-day local series, not a self-comparison against the selected period. The state is a diagnostic hint, not a benchmark, and the UI always shows the component measurements and comparison date range beside it.
 
 ## Cost configuration
 
-NaN and OpenCode Go subscription traffic must not be presented as paid API spend unless a source exposes an actual charge. VibeBar may support an optional local-only model price table with separate input, output, reasoning, cache-read, and cache-write rates. The UI must label the result `Estimated cost` and show the price-source label. No key or provider credential is required.
+NaN and OpenCode Go subscription traffic must not be presented as paid API spend unless a source exposes an actual charge. VibeBar may support an optional local-only model price table with separate input, output, reasoning, cache-read, and cache-write rates. The UI must keep cost coverage conservative for every row: reported cost when the source provides one, `Estimated cost` only when a complete local rate applies, and `Unavailable` otherwise. No key or provider credential is required.
 
 ## Data source and confidence
 

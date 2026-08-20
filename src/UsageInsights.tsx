@@ -26,9 +26,9 @@ function stateTone(diagnostic: EfficiencyDiagnostic): string {
 
 function baselineCopy(diagnostic: EfficiencyDiagnostic): string {
   if (diagnostic.baselineOldestDay == null || diagnostic.baselineNewestDay == null) {
-    return "No reliable 30-day baseline";
+    return "No reliable previous-period baseline";
   }
-  return `Baseline ${diagnostic.baselineOldestDay} → ${diagnostic.baselineNewestDay}`;
+  return `Previous period ${diagnostic.baselineOldestDay} → ${diagnostic.baselineNewestDay}`;
 }
 
 function costLabel(cost: CostSummary): string {
@@ -38,9 +38,15 @@ function costLabel(cost: CostSummary): string {
 }
 
 function costDetail(cost: CostSummary): string {
-  if (cost.kind === "reported") return "Provider source";
-  if (cost.kind === "estimated") return cost.priceSource ?? "Local price table";
-  return "No source charge or complete local rate";
+  const source = cost.kind === "reported"
+    ? "Provider source"
+    : cost.kind === "estimated"
+      ? cost.priceSource ?? "Local price table"
+      : "No source charge or complete local rate";
+  const coverage = cost.tokenBearingRows === 0
+    ? "No token-bearing rows"
+    : `${cost.coveredRows} of ${cost.tokenBearingRows} token-bearing rows covered`;
+  return `${source} · ${coverage}`;
 }
 
 export function DiagnosticBadge({ diagnostic }: { diagnostic: EfficiencyDiagnostic }) {

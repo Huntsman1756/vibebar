@@ -9,6 +9,7 @@ import {
   buildDailyProviderSeries,
   isHistoryUnavailable,
   historyStart,
+  previousComparableHistoryRows,
   sanitizeRepositoryIdentifier,
   selectHistoryRows,
 } from "./history";
@@ -20,7 +21,7 @@ const rows: UsageHistoryRow[] = [
     agent: "executor",
     provider: "nan",
     model: "qwen3.6",
-    source: "opencode-db-messages-31d",
+    source: "opencode-db-messages-90d",
     sourceFidelity: "metadata",
     messageCount: 3,
     sessionCount: 1,
@@ -33,7 +34,7 @@ const rows: UsageHistoryRow[] = [
     agent: "executor",
     provider: "nan",
     model: "qwen3.6",
-    source: "opencode-db-messages-31d",
+    source: "opencode-db-messages-90d",
     sourceFidelity: "metadata",
     messageCount: 2,
     sessionCount: 1,
@@ -46,7 +47,7 @@ const rows: UsageHistoryRow[] = [
     agent: "reviewer",
     provider: "nan",
     model: "deepseek-v4-flash",
-    source: "opencode-db-session-31d-fallback",
+    source: "opencode-db-session-90d-fallback",
     sourceFidelity: "session-fallback",
     messageCount: 0,
     sessionCount: 2,
@@ -59,7 +60,7 @@ const rows: UsageHistoryRow[] = [
     agent: "reviewer",
     provider: "nan",
     model: "deepseek-v4-flash",
-    source: "opencode-db-messages-31d",
+    source: "opencode-db-messages-90d",
     sourceFidelity: "metadata",
     messageCount: 4,
     sessionCount: 1,
@@ -72,7 +73,7 @@ const rows: UsageHistoryRow[] = [
     agent: "planner",
     provider: "opencode-go",
     model: "qwen3.6",
-    source: "vibebar-events-31d",
+    source: "vibebar-events-90d",
     sourceFidelity: "event-fallback",
     messageCount: 0,
     sessionCount: 0,
@@ -85,7 +86,7 @@ const rows: UsageHistoryRow[] = [
     agent: "planner",
     provider: "custom-provider",
     model: "glm5.2",
-    source: "vibebar-events-31d",
+    source: "vibebar-events-90d",
     sourceFidelity: "event-fallback",
     messageCount: 0,
     sessionCount: 0,
@@ -98,7 +99,7 @@ const rows: UsageHistoryRow[] = [
     agent: "assistant",
     provider: "aaa-provider",
     model: "model-a",
-    source: "vibebar-events-31d",
+    source: "vibebar-events-90d",
     sourceFidelity: "event-fallback",
     messageCount: 1,
     sessionCount: 1,
@@ -111,7 +112,7 @@ const rows: UsageHistoryRow[] = [
     agent: "assistant",
     provider: "bbb-provider",
     model: "model-a",
-    source: "vibebar-events-31d",
+    source: "vibebar-events-90d",
     sourceFidelity: "event-fallback",
     messageCount: 1,
     sessionCount: 1,
@@ -166,6 +167,50 @@ describe("selectHistoryRows", () => {
   });
 });
 
+describe("previousComparableHistoryRows", () => {
+  const rowForDay = (day: string): UsageHistoryRow => ({ ...rows[0], day, repository: `github.com/acme/${day}` });
+
+  it("uses the immediately preceding local day for Today", () => {
+    const comparable = previousComparableHistoryRows(
+      [rowForDay("2026-03-13"), rowForDay("2026-03-14"), rowForDay("2026-03-15")],
+      "today",
+      "2026-03-15",
+    );
+
+    expect(comparable.map((row) => row.day)).toEqual(["2026-03-14"]);
+  });
+
+  it("uses the seven calendar days immediately before a 7-day view", () => {
+    const comparable = previousComparableHistoryRows(
+      [rowForDay("2026-03-01"), rowForDay("2026-03-02"), rowForDay("2026-03-08"), rowForDay("2026-03-09"), rowForDay("2026-03-15")],
+      "7d",
+      "2026-03-15",
+    );
+
+    expect(comparable.map((row) => row.day)).toEqual(["2026-03-02", "2026-03-08"]);
+  });
+
+  it("uses the thirty calendar days immediately before a 30-day view", () => {
+    const comparable = previousComparableHistoryRows(
+      [rowForDay("2026-01-15"), rowForDay("2026-02-13"), rowForDay("2026-02-14"), rowForDay("2026-03-15")],
+      "30d",
+      "2026-03-15",
+    );
+
+    expect(comparable.map((row) => row.day)).toEqual(["2026-01-15", "2026-02-13"]);
+  });
+
+  it("uses the complete previous calendar month across month boundaries", () => {
+    const comparable = previousComparableHistoryRows(
+      [rowForDay("2026-01-31"), rowForDay("2026-02-01"), rowForDay("2026-02-28"), rowForDay("2026-03-01"), rowForDay("2026-03-15")],
+      "month",
+      "2026-03-15",
+    );
+
+    expect(comparable.map((row) => row.day)).toEqual(["2026-02-01", "2026-02-28"]);
+  });
+});
+
 describe("aggregateHistoryByProvider", () => {
   it("keeps reasoning tokens separate from billable input and output", () => {
     const row = structuredClone(rows[0]);
@@ -198,9 +243,18 @@ describe("aggregateHistoryByProvider", () => {
 
     expect(tied.map((summary) => `${summary.provider}:${summary.model}`)).toEqual([
       "nan:qwen3.6",
-      "bbb-provider:model-a",
       "aaa-provider:model-a",
+      "bbb-provider:model-a",
     ]);
+  });
+
+  it("withholds a group source cost unless every token-bearing row reports one", () => {
+    const summaries = aggregateHistoryByProvider([
+      { ...rows[0], costMicrousd: 420_000 },
+      { ...rows[0], costMicrousd: null },
+    ]);
+
+    expect(summaries[0].costMicrousd).toBeNull();
   });
 });
 
@@ -216,35 +270,53 @@ describe("observed token totals", () => {
     expect(summary.observedTokens).toBe(38);
   });
 
-  it("orders provider, repository, and agent summaries by observed total", () => {
-    const observedTotalRows: UsageHistoryRow[] = [
+  it("ranks every history aggregate by billable traffic with deterministic text ties", () => {
+    const rankingRows: UsageHistoryRow[] = [
       {
         ...rows[0],
         repository: "github.com/acme/observed",
         agent: "observed-agent",
-        provider: "aaa-provider",
+        provider: "observed-provider",
+        model: "observed-model",
         tokens: { inputTokens: 11, outputTokens: 7, reasoningTokens: 5, cacheReadTokens: 13, cacheWriteTokens: 2 },
       },
       {
         ...rows[0],
-        repository: "github.com/acme/billable",
-        agent: "billable-agent",
+        repository: "github.com/acme/beta",
+        agent: "beta-agent",
         provider: "bbb-provider",
+        model: "model-b",
         tokens: { inputTokens: 30, outputTokens: 0, reasoningTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      },
+      {
+        ...rows[0],
+        repository: "github.com/acme/alpha",
+        agent: "alpha-agent",
+        provider: "aaa-provider",
+        model: "model-a",
+        tokens: { inputTokens: 30, outputTokens: 0, reasoningTokens: 40, cacheReadTokens: 50, cacheWriteTokens: 60 },
       },
     ];
 
-    expect(aggregateHistoryByProvider(observedTotalRows).map((summary) => [summary.provider, summary.observedTokens])).toEqual([
-      ["aaa-provider", 38],
-      ["bbb-provider", 30],
+    expect(aggregateHistoryByProvider(rankingRows).map((summary) => [summary.provider, summary.model, summary.billableTokens, summary.observedTokens])).toEqual([
+      ["aaa-provider", "model-a", 30, 180],
+      ["bbb-provider", "model-b", 30, 30],
+      ["observed-provider", "observed-model", 18, 38],
     ]);
-    expect(aggregateHistoryByRepository(observedTotalRows).map((summary) => [summary.repository, summary.observedTokens])).toEqual([
-      ["github.com/acme/observed", 38],
-      ["github.com/acme/billable", 30],
+    expect(aggregateHistoryByProviderTotals(rankingRows).map((summary) => [summary.provider, summary.billableTokens, summary.observedTokens])).toEqual([
+      ["aaa-provider", 30, 180],
+      ["bbb-provider", 30, 30],
+      ["observed-provider", 18, 38],
     ]);
-    expect(aggregateHistoryByAgent(observedTotalRows).map((summary) => [summary.agent, summary.observedTokens])).toEqual([
-      ["observed-agent", 38],
-      ["billable-agent", 30],
+    expect(aggregateHistoryByRepository(rankingRows).map((summary) => [summary.repository, summary.billableTokens, summary.observedTokens])).toEqual([
+      ["github.com/acme/alpha", 30, 180],
+      ["github.com/acme/beta", 30, 30],
+      ["github.com/acme/observed", 18, 38],
+    ]);
+    expect(aggregateHistoryByAgent(rankingRows).map((summary) => [summary.agent, summary.billableTokens, summary.observedTokens])).toEqual([
+      ["alpha-agent", 30, 180],
+      ["beta-agent", 30, 30],
+      ["observed-agent", 18, 38],
     ]);
   });
 });
@@ -300,8 +372,8 @@ describe("aggregateHistoryByProviderTotals", () => {
 
     expect(summaries.map((summary) => `${summary.provider}:${summary.billableTokens}:${summary.models.join(",")}`)).toEqual([
       "nan:450:deepseek-v4-flash,qwen3.6",
-      "bbb-provider:100:model-a",
       "aaa-provider:100:model-a",
+      "bbb-provider:100:model-a",
       "opencode-go:100:qwen3.6",
     ]);
   });
@@ -391,7 +463,7 @@ describe("aggregateHistoryByAgent", () => {
       cacheTokens: 20,
       messageCount: 4,
       sessionCount: 3,
-      costMicrousd: 400,
+      costMicrousd: null,
       sourceFidelities: ["metadata", "session-fallback"],
     });
   });

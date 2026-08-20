@@ -133,11 +133,7 @@ fn bounded_output(program: &str, args: &[&str], timeout: Duration) -> Result<Str
         return Err(format!("{program} collector output exceeded 8 MiB"));
     }
     if !status.success() {
-        let message = stderr
-            .lines()
-            .last()
-            .unwrap_or("collector exited unsuccessfully");
-        return Err(format!("{program}: {message}"));
+        return Err(format!("{program} collector exited unsuccessfully"));
     }
     Ok(stdout)
 }
@@ -231,7 +227,19 @@ pub fn parse_opencode_stats(output: &str) -> Result<Vec<ProviderSnapshot>, Strin
     Ok(grouped
         .into_iter()
         .map(|(provider, mut models)| {
-            models.sort_by_key(|model| std::cmp::Reverse(model.tokens.observed_total()));
+            models.sort_by(|left, right| {
+                right
+                    .tokens
+                    .primary()
+                    .cmp(&left.tokens.primary())
+                    .then_with(|| {
+                        right
+                            .tokens
+                            .observed_total()
+                            .cmp(&left.tokens.observed_total())
+                    })
+                    .then_with(|| left.model.cmp(&right.model))
+            });
             let calls = models.iter().map(|model| model.calls).sum();
             let tokens = sum_tokens(models.iter().map(|model| &model.tokens));
             ProviderSnapshot {
@@ -604,6 +612,53 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn collector_failure_does_not_expose_stderr() {
+        use std::{
+            env, fs,
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let _guard = ENVIRONMENT_LOCK.lock().unwrap();
+        let test_root = env::temp_dir().join(format!(
+            "vibebar-collector-stderr-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&test_root).unwrap();
+        let executable = test_root.join("vibebar-error-test");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf 'private-token-marker-should-not-leak\\n' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let old_path = env::var_os("PATH");
+        unsafe {
+            env::set_var("PATH", &test_root);
+        }
+        let result = bounded_output("vibebar-error-test", &[], Duration::from_secs(1));
+        unsafe {
+            match old_path {
+                Some(value) => env::set_var("PATH", value),
+                None => env::remove_var("PATH"),
+            }
+        }
+        let _ = fs::remove_dir_all(&test_root);
+
+        assert_eq!(
+            result.unwrap_err(),
+            "vibebar-error-test collector exited unsuccessfully"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn completes_codex_handshake_before_rate_limit_request() {
         use std::{
             env, fs,
@@ -685,8 +740,8 @@ done
     }
 
     #[test]
-    fn parses_opencode_models_ranks_by_observed_total_instead_of_primary() {
-        let input = "│ nan/primary-heavy │\n│  Input Tokens 100 │\n│ nan/cache-heavy │\n│  Input Tokens 1 │\n│  Cache Read 500 │";
+    fn parses_opencode_models_ranks_by_primary_with_observed_total_tiebreak() {
+        let input = "│ nan/primary-tie-plain │\n│  Input Tokens 100 │\n│ nan/primary-tie-cache │\n│  Input Tokens 100 │\n│  Cache Read 50 │\n│ nan/cache-heavy │\n│  Input Tokens 1 │\n│  Cache Read 500 │";
 
         let providers = parse_opencode_stats(input).unwrap();
         let nan = providers
@@ -694,9 +749,13 @@ done
             .find(|provider| provider.id == "nan")
             .unwrap();
 
-        assert_eq!(nan.models[0].model, "cache-heavy");
-        assert_eq!(nan.models[0].tokens.primary(), 1);
-        assert_eq!(nan.models[0].tokens.observed_total(), 501);
+        assert_eq!(
+            nan.models
+                .iter()
+                .map(|model| model.model.as_str())
+                .collect::<Vec<_>>(),
+            ["primary-tie-cache", "primary-tie-plain", "cache-heavy"]
+        );
     }
 
     #[test]

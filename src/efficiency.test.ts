@@ -27,7 +27,7 @@ function row(overrides: RowOverrides = {}): UsageHistoryRow {
     agent: "executor",
     provider: "nan",
     model: "qwen3.6",
-    source: "opencode-db-messages-31d",
+  source: "opencode-db-messages-90d",
     sourceFidelity: "metadata",
     messageCount: 1,
     sessionCount: 1,
@@ -57,18 +57,20 @@ describe("summarizeEfficiency", () => {
 });
 
 describe("diagnoseEfficiency", () => {
-  it("uses the median of daily ratios as the 30-day baseline", () => {
+  it("weights the previous-period baseline ratios by metadata traffic", () => {
     const diagnostic = diagnoseEfficiency(
-      [row({ day: "2026-08-16", inputTokens: 20, outputTokens: 80, cacheReadTokens: 80 })],
+      [row({ day: "2026-08-16", inputTokens: 80, outputTokens: 20, cacheReadTokens: 5 })],
       [
-        row({ day: "2026-08-14", inputTokens: 90, outputTokens: 10, cacheReadTokens: 0 }),
-        row({ day: "2026-08-15", inputTokens: 50, outputTokens: 50, cacheReadTokens: 50 }),
-        row({ day: "2026-08-16", inputTokens: 20, outputTokens: 80, cacheReadTokens: 80 }),
+        row({ day: "2026-08-14", inputTokens: 900, outputTokens: 100, cacheReadTokens: 0 }),
+        row({ day: "2026-08-15", inputTokens: 1, outputTokens: 1, cacheReadTokens: 9 }),
       ],
     );
 
-    expect(diagnostic.baseline.cacheReuse).toBeCloseTo(0.5);
-    expect(diagnostic.baseline.uncachedInputShare).toBeCloseTo(0.5);
+    expect(diagnostic.baseline.cacheReuse).toBeCloseTo(9 / 910);
+    expect(diagnostic.baseline.uncachedInputShare).toBeCloseTo(901 / 1_002);
+    expect(diagnostic.baseline.days).toBe(2);
+    expect(diagnostic.baselineOldestDay).toBe("2026-08-14");
+    expect(diagnostic.baselineNewestDay).toBe("2026-08-15");
     expect(diagnostic.state).toBe("good");
     expect(diagnostic.label).toBe("Good signal");
   });
@@ -108,25 +110,38 @@ describe("contributor ranking", () => {
 });
 
 describe("resolveCost", () => {
-  it("prefers source-reported cost", () => {
+  it("reports provider cost with complete token-bearing coverage", () => {
     expect(resolveCost([row({ costMicrousd: 120 })], {})).toMatchObject({
       kind: "reported",
       amountMicrousd: 120,
+      priceSource: "Provider source",
+      coveredRows: 1,
+      totalRows: 1,
     });
   });
 
   it("calculates a complete local estimate when source cost is unavailable", () => {
     const result = resolveCost(
-      [row({ inputTokens: 1_000_000, outputTokens: 500_000 })],
+      [row({ inputTokens: 1_000_000 })],
       { "nan\u0000qwen3.6": { input: 2, output: 4, reasoning: 0, cacheRead: 1, cacheWrite: 1 } },
     );
 
-    expect(result).toMatchObject({ kind: "estimated", amountMicrousd: 4, priceSource: "Local price table" });
+    expect(result).toMatchObject({
+      kind: "estimated",
+      amountMicrousd: 2_000_000,
+      priceSource: "Local price table",
+      coveredRows: 1,
+      totalRows: 1,
+    });
   });
 
-  it("returns unavailable instead of a partial estimate", () => {
-    const result = resolveCost([row({ inputTokens: 1_000_000 })], {});
+  it("returns unavailable instead of a partial estimate and reports only covered rows", () => {
+    const result = resolveCost([
+      row({ provider: "nan", model: "qwen3.6", inputTokens: 1_000_000 }),
+      row({ provider: "nan", model: "qwen3.6", inputTokens: 1_000_000 }),
+      row({ provider: "unknown", model: "unpriced", inputTokens: 1_000_000 }),
+    ], { "nan\u0000qwen3.6": { input: 2, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 } });
 
-    expect(result).toMatchObject({ kind: "unavailable", amountMicrousd: null });
+    expect(result).toMatchObject({ kind: "unavailable", amountMicrousd: null, coveredRows: 2, tokenBearingRows: 3, totalRows: 3 });
   });
 });

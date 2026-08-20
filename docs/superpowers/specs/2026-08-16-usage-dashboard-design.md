@@ -49,7 +49,7 @@ The popover contains:
 - A compact header with VibeBar, last refresh time, and refresh action.
 - A ChatGPT/Codex card with the available percentage and reset countdown for each exposed rate-limit window.
 - A NaN card with observed tokens, primary traffic, reasoning, cache, and an authoritative remaining percentage only when the provider supplies one.
-- A short “top agents / roles” list for the last 30 days, ranked by observed tokens and then calls.
+- A short “top agents / roles” list for the selected period, ranked by primary traffic and then calls.
 - An explicit “Open full dashboard” action.
 - A small diagnostics link/summary when a collector is unavailable.
 
@@ -63,7 +63,7 @@ The main window keeps the current visual language and adds:
 - NaN model rows with a percentage only when an authoritative provider meter covers the same period.
 - An “Agents and roles” panel with provider/model context, calls, tasks, primary traffic, reasoning, cache, and observed tokens.
 - A clear empty state explaining that agent attribution requires VibeBar events with role and optional token fields.
-- The existing orchestration outcome metrics, recent event stream, telemetry path, and diagnostics.
+- The existing orchestration outcome metrics, recent event stream, privacy-preserving local storage status with its location hidden, and diagnostics.
 
 The UI uses “sin cuota conocida” when NaN documentation does not publish an
 allowance and “cuota no medible con datos locales” when an allowance exists but
@@ -102,7 +102,7 @@ Historical windows use the operating system's local calendar:
 - `30 days`: the current local day plus the 29 preceding local calendar days.
 - `This month`: from the first day of the current local month through the current time.
 
-The backend returns bounded daily buckets for the most recent 31 local calendar days. The frontend derives the four views from that common series so cards, charts, and tables reconcile. A bucket's source timestamp is the assistant-message timestamp when metadata is available; a session-update timestamp is used only by the explicitly labelled lower-fidelity fallback.
+The backend returns bounded daily buckets for the most recent 90 local calendar days, inclusive of the current local day. The frontend derives the four views from that common series so cards, charts, and tables reconcile. A bucket's source timestamp is the assistant-message timestamp when metadata is available; a session-update timestamp is used only by the explicitly labelled lower-fidelity fallback.
 
 The initial NaN allowance reference follows the published model documentation:
 
@@ -123,7 +123,7 @@ OpenCode's local database is the first-class source for OpenCode agent attributi
 
 When the assistant-message metadata query is unavailable because of an older schema or a locked database, the adapter falls back to bounded aggregate columns from `session` (`agent`, `model`, timestamps, directory used only transiently for repository resolution, session count, and token counters). The fallback is labelled lower fidelity because a whole session may be assigned to its last update day.
 
-The preferred aggregation is limited to the most recent 31 local calendar days and groups by:
+The preferred aggregation is limited to the most recent 90 local calendar days and groups by:
 
 ```text
 local-day + repository + agent + provider + model
@@ -148,7 +148,7 @@ For each OpenCode session, VibeBar uses the local project directory only in memo
 3. Preserve a non-GitHub host as `host/owner/repository` when the URL has that shape.
 4. Fall back to `local/<directory-name>` when there is no remote or the directory is unavailable.
 
-The absolute path is never serialized, stored in VibeBar telemetry, shown in the UI, or included in fixtures. Repository identifiers are local-only dashboard data; VibeBar never calls GitHub, tests repository visibility, or sends the identifier over the network. A configuration switch may disable repository attribution entirely, in which case the UI groups the row under `Repository attribution disabled`.
+The absolute path is never serialized, stored in VibeBar telemetry, shown in the UI, or included in fixtures. The local telemetry storage location is an internal Rust detail and is not part of the frontend snapshot contract. Repository identifiers are local-only dashboard data; VibeBar never calls GitHub, tests repository visibility, or sends the identifier over the network. A configuration switch may disable repository attribution entirely, in which case the UI groups the row under `Repository attribution disabled`.
 
 OpenCode model statistics remain the authoritative provider/model total. Database agent rows are not merged with event rows for the same OpenCode agent/provider/model key, preventing double counting. Event rows for other providers remain visible.
 
@@ -159,7 +159,7 @@ Extend the provider-neutral snapshot with:
 - A token-semantic helper or equivalent serialized fields for primary, reasoning, cache, and observed totals.
 - Per-model allowance windows where a model has more than one documented limit; each window explicitly marks its percentage unavailable unless an authoritative provider meter covers that window.
 - `agentUsage`, containing role/agent label, provider, model, calls, distinct tasks, and input/output/reasoning/cache token counters.
-- A bounded `usageHistory` series of daily provider/model/agent/repository buckets for the last 31 local calendar days, with token counters, assistant-message count, session count, source, and optional source-provided cost.
+- A bounded `usageHistory` series of daily provider/model/agent/repository buckets for the last 90 local calendar days, with token counters, assistant-message count, session count, source, and reported/estimated/unavailable cost coverage.
 - An explicit provider identity/label and source-fidelity field so NaN, OpenCode Go, unknown providers, message metadata, and session fallback remain distinguishable.
 - A bounded OpenCode database adapter that resolves the known local data paths and uses a read-only SQLite connection. The preferred query extracts only whitelisted assistant-message metadata; the session aggregate query remains the compatibility fallback.
 - An in-memory repository resolver that reads Git metadata without returning absolute paths and caches each directory resolution during a snapshot refresh.
@@ -208,7 +208,7 @@ Backend tests must cover:
 - NaN allowance references include the documented models but never create a percentage without an authoritative provider meter.
 - Quota percentage remains unavailable when only local counters and a published allowance are present.
 - Multi-window model quotas can be represented without losing the monthly/rolling distinction.
-- Agent aggregation groups by role/provider/model, counts attempts and distinct tasks, and restricts to the 30-day window.
+- Agent aggregation groups by role/provider/model, counts attempts and distinct tasks, and derives selected-period views from the retained 90-day local series.
 - Provider normalization keeps `nan`, `opencode-go`, and unknown providers distinct.
 - Metadata-only assistant-message aggregation produces daily provider/model/agent/repository buckets and never exposes raw message data.
 - Repository URL normalization handles GitHub SSH/HTTPS, non-GitHub remotes, no remote, worktree paths, and disabled attribution without returning absolute paths.

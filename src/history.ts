@@ -18,7 +18,8 @@ type AggregateBucket = {
   messageCount: number;
   sessionCount: number;
   costMicrousd: number;
-  hasCost: boolean;
+  tokenBearingRows: number;
+  reportedCostRows: number;
   sources: Set<string>;
   sourceFidelities: Set<HistorySourceFidelity>;
   providers: Set<string>;
@@ -81,7 +82,8 @@ function createBucket(): AggregateBucket {
     messageCount: 0,
     sessionCount: 0,
     costMicrousd: 0,
-    hasCost: false,
+    tokenBearingRows: 0,
+    reportedCostRows: 0,
     sources: new Set<string>(),
     sourceFidelities: new Set<HistorySourceFidelity>(),
     providers: new Set<string>(),
@@ -102,8 +104,17 @@ function addRow(bucket: AggregateBucket, row: UsageHistoryRow): void {
   bucket.providers.add(row.provider);
   bucket.models.add(row.model);
 
+  const tokenBearing = row.tokens.inputTokens
+    + row.tokens.outputTokens
+    + (row.tokens.reasoningTokens ?? 0)
+    + row.tokens.cacheReadTokens
+    + row.tokens.cacheWriteTokens > 0
+    || row.costMicrousd != null;
+  if (tokenBearing) {
+    bucket.tokenBearingRows += 1;
+  }
   if (row.costMicrousd != null) {
-    bucket.hasCost = true;
+    bucket.reportedCostRows += 1;
     bucket.costMicrousd += row.costMicrousd;
   }
 }
@@ -126,7 +137,9 @@ function summarizeBucket(bucket: AggregateBucket) {
     cacheWriteTokens: bucket.cacheWriteTokens,
     messageCount: bucket.messageCount,
     sessionCount: bucket.sessionCount,
-    costMicrousd: bucket.hasCost ? bucket.costMicrousd : null,
+    costMicrousd: bucket.tokenBearingRows > 0 && bucket.reportedCostRows === bucket.tokenBearingRows
+      ? bucket.costMicrousd
+      : null,
     sources: [...bucket.sources].sort(compareText),
     sourceFidelities: [...bucket.sourceFidelities].sort((left, right) =>
       (fidelityOrder[left] ?? 99) - (fidelityOrder[right] ?? 99) || compareText(left, right)),
@@ -168,6 +181,22 @@ export function selectHistoryRows(rows: UsageHistoryRow[], range: HistoryRange, 
     .sort(compareRows);
 }
 
+export function previousComparableHistoryRows(
+  rows: UsageHistoryRow[],
+  range: HistoryRange,
+  today: string,
+): UsageHistoryRow[] {
+  const selectedStart = historyStart(range, today);
+  const previousEnd = shiftLocalDays(selectedStart, -1);
+  const previousStart = range === "month"
+    ? formatLocalIsoDate(new Date(parseLocalIsoDate(previousEnd).getFullYear(), parseLocalIsoDate(previousEnd).getMonth(), 1))
+    : shiftLocalDays(previousEnd, range === "today" ? 0 : range === "7d" ? -6 : -29);
+
+  return [...rows]
+    .filter((row) => row.day >= previousStart && row.day <= previousEnd)
+    .sort(compareRows);
+}
+
 export function aggregateHistoryByProvider(rows: UsageHistoryRow[]): ProviderHistorySummary[] {
   const buckets = new Map<string, AggregateBucket>();
 
@@ -183,7 +212,7 @@ export function aggregateHistoryByProvider(rows: UsageHistoryRow[]): ProviderHis
       const [provider, model] = key.split("\u0000");
       return { provider, model, ...summarizeBucket(bucket) };
     })
-    .sort((left, right) => right.observedTokens - left.observedTokens
+    .sort((left, right) => right.billableTokens - left.billableTokens
       || compareText(left.provider, right.provider)
       || compareText(left.model, right.model));
 }
@@ -203,7 +232,7 @@ export function aggregateHistoryByProviderTotals(rows: UsageHistoryRow[]): Provi
       models: [...bucket.models].sort(compareText),
       ...summarizeBucket(bucket),
     }))
-    .sort((left, right) => right.observedTokens - left.observedTokens
+    .sort((left, right) => right.billableTokens - left.billableTokens
       || compareText(left.provider, right.provider));
 }
 
@@ -278,7 +307,7 @@ export function aggregateHistoryByRepository(rows: UsageHistoryRow[]): Repositor
       models: [...bucket.models].sort(compareText),
       ...summarizeBucket(bucket),
     }))
-    .sort((left, right) => right.observedTokens - left.observedTokens
+    .sort((left, right) => right.billableTokens - left.billableTokens
       || compareText(left.repository, right.repository));
 }
 
@@ -297,7 +326,7 @@ export function aggregateHistoryByAgent(rows: UsageHistoryRow[]): AgentHistorySu
       const [agent, provider, model, repository] = key.split("\u0000");
       return { agent, provider, model, repository, ...summarizeBucket(bucket) };
     })
-    .sort((left, right) => right.observedTokens - left.observedTokens
+    .sort((left, right) => right.billableTokens - left.billableTokens
       || compareText(left.agent, right.agent)
       || compareText(left.provider, right.provider)
       || compareText(left.model, right.model)

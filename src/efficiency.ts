@@ -55,6 +55,7 @@ export type CostSummary = {
   amountMicrousd: number | null;
   priceSource: string | null;
   coveredRows: number;
+  tokenBearingRows: number;
   totalRows: number;
 };
 
@@ -160,17 +161,12 @@ export function diagnoseEfficiency(rows: UsageHistoryRow[], baselineRows: UsageH
   const metadataRows = rows.filter((row) => row.sourceFidelity === "metadata");
   const baselineMetadataRows = baselineRows.filter((row) => row.sourceFidelity === "metadata");
   const baselineDays = dailyEfficiency(baselineMetadataRows);
-  const baselineCacheReuse = median(baselineDays
-    .map((day) => day.cacheReuse)
-    .filter((value): value is number => value != null));
-  const baselineUncachedInputShare = median(baselineDays
-    .map((day) => day.uncachedInputShare)
-    .filter((value): value is number => value != null));
+  const baselineSummary = summarizeEfficiency(baselineMetadataRows);
   const baselineOldestDay = baselineDays[0]?.day ?? null;
   const baselineNewestDay = baselineDays[baselineDays.length - 1]?.day ?? null;
   const baseline = {
-    cacheReuse: baselineCacheReuse,
-    uncachedInputShare: baselineUncachedInputShare,
+    cacheReuse: baselineSummary.cacheReuse,
+    uncachedInputShare: baselineSummary.uncachedInputShare,
     days: baselineDays.length,
   };
   const common = {
@@ -193,7 +189,7 @@ export function diagnoseEfficiency(rows: UsageHistoryRow[], baselineRows: UsageH
     return { ...common, state: "insufficient", label: "Insufficient data", reason: "The selected traffic is missing a denominator for one of the efficiency signals." };
   }
   if (baseline.cacheReuse == null || baseline.uncachedInputShare == null) {
-    return { ...common, state: "insufficient", label: "Insufficient data", reason: "There is not enough message metadata to establish a 30-day local baseline." };
+    return { ...common, state: "insufficient", label: "Insufficient data", reason: "There is not enough message metadata to establish a previous-period local baseline." };
   }
 
   const cacheReuseWorse = selected.cacheReuse < baseline.cacheReuse - MATERIAL_CHANGE;
@@ -220,35 +216,39 @@ function estimateRowCost(row: UsageHistoryRow, price: ModelPrice): number {
     + (row.tokens.reasoningTokens ?? 0) * price.reasoning
     + row.tokens.cacheReadTokens * price.cacheRead
     + row.tokens.cacheWriteTokens * price.cacheWrite
-  ) / 1_000_000;
+  );
 }
 
 export function resolveCost(rows: UsageHistoryRow[], priceTable: LocalPriceTable): CostSummary {
   const tokenBearingRows = rows.filter((row) => tokenTotals(row.tokens).observedTokens > 0 || row.costMicrousd != null);
   if (tokenBearingRows.length === 0) {
-    return { kind: "unavailable", amountMicrousd: null, priceSource: null, coveredRows: 0, totalRows: rows.length };
+    return { kind: "unavailable", amountMicrousd: null, priceSource: null, coveredRows: 0, tokenBearingRows: 0, totalRows: rows.length };
   }
 
   let amountMicrousd = 0;
   let estimatedRows = 0;
+  let coveredRows = 0;
   for (const row of tokenBearingRows) {
     if (row.costMicrousd != null) {
       amountMicrousd += row.costMicrousd;
+      coveredRows += 1;
       continue;
     }
     const price = priceTable[`${row.provider}\u0000${row.model}`];
     if (!hasCompletePrice(price)) {
-      return { kind: "unavailable", amountMicrousd: null, priceSource: null, coveredRows: tokenBearingRows.length - estimatedRows, totalRows: rows.length };
+      return { kind: "unavailable", amountMicrousd: null, priceSource: null, coveredRows, tokenBearingRows: tokenBearingRows.length, totalRows: rows.length };
     }
     amountMicrousd += estimateRowCost(row, price);
     estimatedRows += 1;
+    coveredRows += 1;
   }
 
   return {
     kind: estimatedRows > 0 ? "estimated" : "reported",
     amountMicrousd,
     priceSource: estimatedRows > 0 ? "Local price table" : "Provider source",
-    coveredRows: tokenBearingRows.length,
+    coveredRows,
+    tokenBearingRows: tokenBearingRows.length,
     totalRows: rows.length,
   };
 }

@@ -9,14 +9,14 @@ use crate::collectors::{opencode_database_path, opencode_model_identity};
 use crate::domain::{
     AgentUsage, TokenUsage, UsageHistory, UsageHistoryRow, aggregate_history_rows,
 };
-use crate::history::local_day;
+use crate::history::{RETAINED_HISTORY_DAYS, local_day};
 use crate::identity::{
     RepositoryResolver, normalize_provider_id, repository_identifier_from_remote,
 };
 
-const MESSAGE_SOURCE: &str = "opencode-db-messages-31d";
+const MESSAGE_SOURCE: &str = "opencode-db-messages-90d";
 const MESSAGE_FIDELITY: &str = "metadata";
-const SESSION_FALLBACK_SOURCE: &str = "opencode-db-session-31d-fallback";
+const SESSION_FALLBACK_SOURCE: &str = "opencode-db-session-90d-fallback";
 const SESSION_FALLBACK_FIDELITY: &str = "session-fallback";
 const OPENCODE_HISTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const OPENCODE_HISTORY_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
@@ -81,6 +81,7 @@ struct HistoryAccumulator {
     message_count: u64,
     tokens: TokenUsage,
     cost_microusd: Option<u64>,
+    has_unpriced_tokens: bool,
     sessions: HashSet<String>,
 }
 
@@ -96,6 +97,7 @@ impl Default for HistoryAccumulator {
                 cache_write_tokens: 0,
             },
             cost_microusd: None,
+            has_unpriced_tokens: false,
             sessions: HashSet::new(),
         }
     }
@@ -200,7 +202,7 @@ fn collect_usage_from_connection(
                         )
                     })?;
                 if fallback.history.rows.is_empty() && fallback.agent_usage.is_empty() {
-                    Err("OpenCode history database has no usage rows in the last 31 days".into())
+                    Err("OpenCode history database has no usage rows in the last 90 days".into())
                 } else {
                     Ok(fallback)
                 }
@@ -222,7 +224,7 @@ fn collect_history_from_connection(
                 let fallback =
                     query_session_usage(connection, since_millis, resolver, deadline)?.history;
                 if fallback.rows.is_empty() {
-                    Err("OpenCode history database has no usage rows in the last 31 days".into())
+                    Err("OpenCode history database has no usage rows in the last 90 days".into())
                 } else {
                     Ok(fallback)
                 }
@@ -243,7 +245,7 @@ fn collect_opencode_agents_from_connection(
                 let fallback =
                     query_session_agent_usage_fallback(connection, since_millis, deadline)?;
                 if fallback.is_empty() {
-                    Err("OpenCode history database has no agent usage in the last 31 days".into())
+                    Err("OpenCode history database has no agent usage in the last 90 days".into())
                 } else {
                     Ok(fallback)
                 }
@@ -405,7 +407,16 @@ fn query_message_usage(
             record.cache_read_tokens,
             record.cache_write_tokens,
         );
-        if let Some(cost) = record.cost_dollars.and_then(dollars_to_microusd) {
+        let cost_microusd = record.cost_dollars.and_then(dollars_to_microusd);
+        let record_has_tokens = record.input_tokens > 0
+            || record.output_tokens > 0
+            || record.reasoning_tokens > 0
+            || record.cache_read_tokens > 0
+            || record.cache_write_tokens > 0;
+        if record_has_tokens && cost_microusd.is_none() {
+            history_entry.has_unpriced_tokens = true;
+            history_entry.cost_microusd = None;
+        } else if let Some(cost) = cost_microusd.filter(|_| !history_entry.has_unpriced_tokens) {
             history_entry.cost_microusd = Some(
                 history_entry
                     .cost_microusd
@@ -646,7 +657,7 @@ fn local_history_window_start_millis() -> i64 {
 }
 
 fn local_history_window_start_millis_for(now: DateTime<Local>) -> i64 {
-    local_midnight_millis(now.date_naive() - Days::new(30))
+    local_midnight_millis(now.date_naive() - Days::new(RETAINED_HISTORY_DAYS - 1))
 }
 
 fn local_midnight_millis(day: NaiveDate) -> i64 {
@@ -757,8 +768,14 @@ fn sort_agent_usage(usage: &mut [AgentUsage]) {
     usage.sort_by(|left, right| {
         right
             .tokens
-            .observed_total()
-            .cmp(&left.tokens.observed_total())
+            .primary()
+            .cmp(&left.tokens.primary())
+            .then_with(|| {
+                right
+                    .tokens
+                    .observed_total()
+                    .cmp(&left.tokens.observed_total())
+            })
             .then_with(|| right.calls.cmp(&left.calls))
             .then_with(|| left.agent.cmp(&right.agent))
             .then_with(|| left.provider.cmp(&right.provider))
@@ -1121,7 +1138,7 @@ mod tests {
         assert_eq!(nan_executor.tokens.cache_write_tokens, 6);
         assert_eq!(nan_executor.tokens.billable(), 170);
         assert_eq!(nan_executor.tokens.cache(), 18);
-        assert_eq!(nan_executor.cost_microusd, Some(10_000_000));
+        assert_eq!(nan_executor.cost_microusd, None);
         assert_eq!(nan_executor.source, MESSAGE_SOURCE);
         assert_eq!(nan_executor.source_fidelity, MESSAGE_FIDELITY);
 
@@ -1230,10 +1247,10 @@ mod tests {
     }
 
     #[test]
-    fn opencode_agent_usage_ranks_by_observed_total_instead_of_primary() {
+    fn opencode_agent_usage_ranks_by_primary_with_observed_total_tiebreak() {
         let mut usage = vec![
             AgentUsage {
-                agent: "primary-heavy".into(),
+                agent: "primary-tie-plain".into(),
                 provider: "nan".into(),
                 model: "qwen3.6".into(),
                 source: MESSAGE_SOURCE.into(),
@@ -1244,6 +1261,21 @@ mod tests {
                     output_tokens: 0,
                     reasoning_tokens: 0,
                     cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+            },
+            AgentUsage {
+                agent: "primary-tie-cache".into(),
+                provider: "nan".into(),
+                model: "qwen3.6".into(),
+                source: MESSAGE_SOURCE.into(),
+                calls: 1,
+                tasks: 1,
+                tokens: TokenUsage {
+                    input_tokens: 80,
+                    output_tokens: 20,
+                    reasoning_tokens: 0,
+                    cache_read_tokens: 50,
                     cache_write_tokens: 0,
                 },
             },
@@ -1286,7 +1318,12 @@ mod tests {
                 .iter()
                 .map(|item| item.agent.as_str())
                 .collect::<Vec<_>>(),
-            ["reasoning-heavy", "cache-heavy", "primary-heavy"]
+            [
+                "primary-tie-cache",
+                "primary-tie-plain",
+                "reasoning-heavy",
+                "cache-heavy"
+            ]
         );
     }
 
@@ -1497,7 +1534,8 @@ mod tests {
     }
 
     #[test]
-    fn local_history_window_starts_at_local_midnight_thirty_days_before_today() {
+    fn local_history_window_starts_at_local_midnight_eighty_nine_days_before_today_for_ninety_inclusive_days()
+     {
         let now = Local
             .with_ymd_and_hms(2026, 8, 16, 12, 0, 0)
             .single()
@@ -1505,12 +1543,12 @@ mod tests {
 
         assert_eq!(
             local_history_window_start_millis_for(now),
-            local_timestamp(2026, 7, 17, 0)
+            local_timestamp(2026, 5, 19, 0)
         );
     }
 
     #[test]
-    fn combined_message_query_builds_history_and_agents_with_micro_usd_cost() {
+    fn combined_message_query_keeps_cost_unavailable_for_mixed_cost_messages() {
         let repo_root = TestDir::new("combined");
         let repo = create_repo(
             repo_root.path(),
@@ -1547,6 +1585,24 @@ mod tests {
                 ),
             )
             .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                (
+                    "m2",
+                    "s1",
+                    timestamp,
+                    json!({
+                        "role": "assistant",
+                        "agent": "executor",
+                        "modelID": "qwen3.6",
+                        "providerID": "NaN",
+                        "tokens": { "input": 1 }
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
 
         let mut resolver = RepositoryResolver::new(true);
         let bundle = collect_usage_from_connection(
@@ -1557,10 +1613,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(bundle.history.rows.len(), 1);
-        assert_eq!(bundle.history.rows[0].cost_microusd, Some(123_456));
+        assert_eq!(bundle.history.rows[0].cost_microusd, None);
         assert_eq!(bundle.agent_usage.len(), 1);
         assert_eq!(bundle.agent_usage[0].provider, "nan");
-        assert_eq!(bundle.agent_usage[0].tokens.billable(), 12);
+        assert_eq!(bundle.agent_usage[0].tokens.billable(), 13);
         assert_eq!(
             serde_json::to_value(&bundle.history.rows[0].tokens).unwrap()["reasoningTokens"],
             7
@@ -1810,7 +1866,7 @@ mod tests {
 
         let merged = merge_agent_usage_sources(
             vec![agent(" NaN ", MESSAGE_SOURCE)],
-            vec![agent("nan", "vibebar-events-30d")],
+            vec![agent("nan", "vibebar-events-90d")],
         );
 
         assert_eq!(merged.len(), 1);
@@ -1856,7 +1912,7 @@ mod tests {
                 agent: "executor".into(),
                 provider: " NaN ".into(),
                 model: "qwen3.6".into(),
-                source: "vibebar-events-30d".into(),
+                source: "vibebar-events-90d".into(),
                 calls: 99,
                 tasks: 99,
                 tokens: TokenUsage {
@@ -1871,7 +1927,7 @@ mod tests {
                 agent: "reviewer".into(),
                 provider: "nan".into(),
                 model: "deepseek-v4-flash".into(),
-                source: "vibebar-events-30d".into(),
+                source: "vibebar-events-90d".into(),
                 calls: 9,
                 tasks: 4,
                 tokens: TokenUsage {
@@ -1886,7 +1942,7 @@ mod tests {
                 agent: "reviewer".into(),
                 provider: "chatgpt".into(),
                 model: "codex".into(),
-                source: "vibebar-events-30d".into(),
+                source: "vibebar-events-90d".into(),
                 calls: 2,
                 tasks: 2,
                 tokens: TokenUsage {
@@ -1901,7 +1957,7 @@ mod tests {
                 agent: "executor".into(),
                 provider: "opencode-go".into(),
                 model: "qwen3.6".into(),
-                source: "vibebar-events-30d".into(),
+                source: "vibebar-events-90d".into(),
                 calls: 1,
                 tasks: 1,
                 tokens: TokenUsage {
@@ -1916,7 +1972,7 @@ mod tests {
                 agent: "auditor".into(),
                 provider: "custom-provider".into(),
                 model: "glm5.2".into(),
-                source: "vibebar-events-30d".into(),
+                source: "vibebar-events-90d".into(),
                 calls: 7,
                 tasks: 7,
                 tokens: TokenUsage {
@@ -1937,13 +1993,13 @@ mod tests {
             item.agent == "reviewer"
                 && item.provider == "nan"
                 && item.model == "deepseek-v4-flash"
-                && item.source == "vibebar-events-30d"
+                && item.source == "vibebar-events-90d"
         }));
         assert!(merged.iter().any(|item| {
             item.agent == "auditor"
                 && item.provider == "custom-provider"
                 && item.model == "glm5.2"
-                && item.source == "vibebar-events-30d"
+                && item.source == "vibebar-events-90d"
         }));
         let primary_nan = merged
             .iter()

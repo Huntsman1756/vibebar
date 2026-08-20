@@ -13,7 +13,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chrono::{DateTime, Days, Duration, Local, LocalResult, TimeZone, Utc};
+use chrono::{DateTime, Days, Local, LocalResult, TimeZone, Utc};
 use domain::{
     DashboardSnapshot, ModelUsage, ProviderSnapshot, REPOSITORY_ATTRIBUTION_DISABLED, RecentEvent,
     TokenUsage, UsageEvent, UsageHistory, UsageHistoryRow, aggregate_agent_usage,
@@ -36,7 +36,7 @@ struct AppState {
 fn opencode_session_fallback_diagnostic(agent_usage: &[domain::AgentUsage]) -> Option<String> {
     agent_usage
         .iter()
-        .any(|item| item.source == "opencode-db-session-31d-fallback")
+        .any(|item| item.source == "opencode-db-session-90d-fallback")
         .then(|| {
             "OpenCode agent usage is using lower-fidelity session aggregates because assistant message metadata was unavailable."
                 .into()
@@ -47,7 +47,7 @@ fn opencode_history_session_fallback_diagnostic(history: &UsageHistory) -> Optio
     history
         .rows
         .iter()
-        .any(|row| row.source == "opencode-db-session-31d-fallback")
+        .any(|row| row.source == "opencode-db-session-90d-fallback")
         .then(|| {
             "OpenCode usage history is using lower-fidelity session aggregates because assistant message metadata was unavailable."
                 .into()
@@ -62,7 +62,7 @@ fn usage_history_truncation_diagnostic(history: &UsageHistory) -> Option<String>
 
 fn local_history_window_start(now: DateTime<Utc>) -> DateTime<Utc> {
     let local_now = now.with_timezone(&Local);
-    let day = local_now.date_naive() - Days::new(30);
+    let day = local_now.date_naive() - Days::new(history::RETAINED_HISTORY_DAYS - 1);
     let midnight = day.and_hms_opt(0, 0, 0).expect("valid local midnight");
     let local_start = match Local.from_local_datetime(&midnight) {
         LocalResult::Single(datetime) => datetime,
@@ -86,7 +86,7 @@ fn provider_history_from_events(events: &[UsageEvent], since: DateTime<Utc>) -> 
             agent: event.role.clone(),
             provider: normalize_provider_id(&event.provider),
             model: event.model.clone(),
-            source: "vibebar-events-31d".into(),
+            source: "vibebar-events-90d".into(),
             source_fidelity: "event-fallback".into(),
             message_count: 0,
             session_count: 0,
@@ -206,8 +206,14 @@ fn reconcile_provider_cards_with_history(
         models.sort_by(|left, right| {
             right
                 .tokens
-                .observed_total()
-                .cmp(&left.tokens.observed_total())
+                .primary()
+                .cmp(&left.tokens.primary())
+                .then_with(|| {
+                    right
+                        .tokens
+                        .observed_total()
+                        .cmp(&left.tokens.observed_total())
+                })
                 .then_with(|| right.calls.cmp(&left.calls))
                 .then_with(|| left.model.cmp(&right.model))
         });
@@ -216,7 +222,7 @@ fn reconcile_provider_cards_with_history(
         providers.push(ProviderSnapshot {
             id: provider_id.clone(),
             label: provider_label(&provider_id),
-            source: "usage-history-31d".into(),
+            source: "usage-history-90d".into(),
             status: "ok".into(),
             calls,
             tokens,
@@ -260,7 +266,6 @@ fn sum_model_tokens(models: &[ModelUsage]) -> TokenUsage {
 
 struct SnapshotBuildInputs {
     now: DateTime<Utc>,
-    telemetry_path: String,
     providers: Vec<domain::ProviderSnapshot>,
     events: Vec<UsageEvent>,
     diagnostics: Vec<String>,
@@ -271,7 +276,6 @@ struct SnapshotBuildInputs {
 fn build_snapshot_from_sources(inputs: SnapshotBuildInputs) -> DashboardSnapshot {
     let SnapshotBuildInputs {
         now,
-        telemetry_path,
         providers,
         events,
         mut diagnostics,
@@ -309,7 +313,7 @@ fn build_snapshot_from_sources(inputs: SnapshotBuildInputs) -> DashboardSnapshot
             kind: event.kind.clone(),
         })
         .collect();
-    let event_agent_usage = aggregate_agent_usage(&events, now - Duration::days(30));
+    let event_agent_usage = aggregate_agent_usage(&events, history_since);
     let agent_usage = match opencode_agent_usage {
         Some(opencode_usage) => {
             if let Some(diagnostic) = opencode_session_fallback_diagnostic(&opencode_usage) {
@@ -328,7 +332,6 @@ fn build_snapshot_from_sources(inputs: SnapshotBuildInputs) -> DashboardSnapshot
 
     DashboardSnapshot {
         generated_at: now.to_rfc3339(),
-        telemetry_path,
         providers,
         agent_usage,
         usage_history,
@@ -391,7 +394,6 @@ fn build_snapshot(data_dir: &std::path::Path) -> DashboardSnapshot {
     }
     build_snapshot_from_sources(SnapshotBuildInputs {
         now,
-        telemetry_path: storage::telemetry_path(data_dir).display().to_string(),
         providers,
         events,
         diagnostics,
@@ -430,13 +432,6 @@ async fn dashboard_snapshot(state: State<'_, AppState>) -> Result<DashboardSnaps
 #[tauri::command]
 fn ingest_events(state: State<'_, AppState>, events: Vec<UsageEvent>) -> Result<usize, String> {
     storage::append_events(&state.data_dir, &events)
-}
-
-#[tauri::command]
-fn telemetry_path(state: State<'_, AppState>) -> String {
-    storage::telemetry_path(&state.data_dir)
-        .display()
-        .to_string()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -488,7 +483,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             dashboard_snapshot,
             ingest_events,
-            telemetry_path,
             open_full_dashboard
         ])
         .run(tauri::generate_context!())
@@ -618,13 +612,13 @@ mod tests {
     #[test]
     fn session_fallback_agent_usage_produces_snapshot_diagnostic() {
         assert!(
-            opencode_session_fallback_diagnostic(&[usage("opencode-db-session-31d-fallback")])
+            opencode_session_fallback_diagnostic(&[usage("opencode-db-session-90d-fallback")])
                 .is_some()
         );
         assert!(
-            opencode_session_fallback_diagnostic(&[usage("opencode-db-messages-31d")]).is_none()
+            opencode_session_fallback_diagnostic(&[usage("opencode-db-messages-90d")]).is_none()
         );
-        assert!(opencode_session_fallback_diagnostic(&[usage("vibebar-events-30d")]).is_none());
+        assert!(opencode_session_fallback_diagnostic(&[usage("vibebar-events-90d")]).is_none());
     }
 
     #[test]
@@ -638,7 +632,7 @@ mod tests {
                     agent: "executor",
                     provider: "nan",
                     model: "qwen3.6",
-                    source: "opencode-db-messages-31d",
+                    source: "opencode-db-messages-90d",
                     source_fidelity: "metadata",
                     input_tokens: 120,
                     output_tokens: 30,
@@ -649,7 +643,7 @@ mod tests {
                     agent: "reviewer",
                     provider: "opencode-go",
                     model: "qwen3.6",
-                    source: "opencode-db-messages-31d",
+                    source: "opencode-db-messages-90d",
                     source_fidelity: "metadata",
                     input_tokens: 40,
                     output_tokens: 5,
@@ -708,12 +702,12 @@ mod tests {
         assert!(merged.rows.iter().any(|row| {
             row.provider == "nan"
                 && row.model == "deepseek-v4-flash"
-                && row.source == "vibebar-events-31d"
+                && row.source == "vibebar-events-90d"
         }));
         assert!(merged.rows.iter().any(|row| {
             row.provider == "opencode-go"
                 && row.model == "glm5.2"
-                && row.source == "vibebar-events-31d"
+                && row.source == "vibebar-events-90d"
         }));
     }
 
@@ -728,7 +722,7 @@ mod tests {
                     agent: "executor",
                     provider: "nan",
                     model: "qwen3.6",
-                    source: "opencode-db-messages-31d",
+                    source: "opencode-db-messages-90d",
                     source_fidelity: "metadata",
                     input_tokens: 120,
                     output_tokens: 30,
@@ -739,7 +733,7 @@ mod tests {
                     agent: "reviewer",
                     provider: "opencode-go",
                     model: "qwen3.6",
-                    source: "opencode-db-messages-31d",
+                    source: "opencode-db-messages-90d",
                     source_fidelity: "metadata",
                     input_tokens: 40,
                     output_tokens: 5,
@@ -778,12 +772,12 @@ mod tests {
 
         assert!(merged.rows.iter().any(|row| {
             row.provider == "chatgpt-codex"
-                && row.source == "vibebar-events-31d"
+                && row.source == "vibebar-events-90d"
                 && row.repository == "Repository attribution disabled"
         }));
         assert!(merged.rows.iter().any(|row| {
             row.provider == "custom-provider"
-                && row.source == "vibebar-events-31d"
+                && row.source == "vibebar-events-90d"
                 && row.repository == "Repository attribution disabled"
         }));
     }
@@ -798,7 +792,7 @@ mod tests {
                 agent: "executor",
                 provider: "nan",
                 model: "qwen3.6",
-                source: "opencode-db-messages-31d",
+                source: "opencode-db-messages-90d",
                 source_fidelity: "metadata",
                 input_tokens: 120,
                 output_tokens: 30,
@@ -830,7 +824,7 @@ mod tests {
         assert!(merged.rows.iter().any(|row| {
             row.provider == "nan"
                 && row.model == "deepseek-v4-flash"
-                && row.source == "vibebar-events-31d"
+                && row.source == "vibebar-events-90d"
         }));
     }
 
@@ -844,7 +838,7 @@ mod tests {
                 agent: "executor",
                 provider: "nan",
                 model: "qwen3.6",
-                source: "opencode-db-messages-31d",
+                source: "opencode-db-messages-90d",
                 source_fidelity: "metadata",
                 input_tokens: 120,
                 output_tokens: 30,
@@ -902,15 +896,15 @@ mod tests {
         assert!(merged.rows.iter().any(|row| {
             row.agent == "executor"
                 && row.model == "qwen3.6"
-                && row.source == "opencode-db-messages-31d"
+                && row.source == "opencode-db-messages-90d"
         }));
         assert!(merged.rows.iter().any(|row| {
             row.agent == "executor"
                 && row.model == "deepseek-v4-flash"
-                && row.source == "vibebar-events-31d"
+                && row.source == "vibebar-events-90d"
         }));
         assert!(merged.rows.iter().any(|row| {
-            row.agent == "reviewer" && row.model == "qwen3.6" && row.source == "vibebar-events-31d"
+            row.agent == "reviewer" && row.model == "qwen3.6" && row.source == "vibebar-events-90d"
         }));
     }
 
@@ -949,12 +943,52 @@ mod tests {
             history.rows[0].repository,
             "Repository attribution disabled"
         );
-        assert_eq!(history.rows[0].source, "vibebar-events-31d");
+        assert_eq!(history.rows[0].source, "vibebar-events-90d");
         assert_eq!(history.rows[0].source_fidelity, "event-fallback");
         assert_eq!(history.rows[0].tokens.billable(), 70);
         assert_eq!(history.rows[0].message_count, 0);
         assert_eq!(history.rows[0].session_count, 0);
         assert!(!history.repository_attribution_enabled);
+    }
+
+    #[test]
+    fn snapshot_aggregates_event_agents_across_the_same_ninety_day_history_boundary() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
+        let history_since = Utc.with_ymd_and_hms(2026, 5, 19, 0, 0, 0).unwrap();
+        let snapshot = build_snapshot_from_sources(SnapshotBuildInputs {
+            now,
+            providers: Vec::new(),
+            events: vec![
+                event(EventSpec {
+                    event_id: "evt-at-boundary",
+                    occurred_at: history_since,
+                    provider: "chatgpt-codex",
+                    model: "codex",
+                    role: "reviewer",
+                    task_id: "task-at-boundary",
+                    input_tokens: 60,
+                    output_tokens: 10,
+                }),
+                event(EventSpec {
+                    event_id: "evt-before-boundary",
+                    occurred_at: Utc.with_ymd_and_hms(2026, 5, 18, 23, 59, 59).unwrap(),
+                    provider: "chatgpt-codex",
+                    model: "codex",
+                    role: "reviewer",
+                    task_id: "task-before-boundary",
+                    input_tokens: 999,
+                    output_tokens: 1,
+                }),
+            ],
+            diagnostics: Vec::new(),
+            opencode_usage: Err("OpenCode history database is unavailable".into()),
+            history_since,
+        });
+
+        assert_eq!(snapshot.usage_history.rows.len(), 1);
+        assert_eq!(snapshot.agent_usage.len(), 1);
+        assert_eq!(snapshot.agent_usage[0].source, "vibebar-events-90d");
+        assert_eq!(snapshot.agent_usage[0].tokens.billable(), 70);
     }
 
     #[test]
@@ -973,7 +1007,7 @@ mod tests {
                 agent: "executor",
                 provider: "nan",
                 model: "qwen3.6",
-                source: "opencode-db-session-31d-fallback",
+                source: "opencode-db-session-90d-fallback",
                 source_fidelity: "session-fallback",
                 input_tokens: 120,
                 output_tokens: 30,
@@ -985,7 +1019,6 @@ mod tests {
         };
         let snapshot = build_snapshot_from_sources(SnapshotBuildInputs {
             now,
-            telemetry_path: "/tmp/events-v1.jsonl".into(),
             providers,
             events: vec![event(EventSpec {
                 event_id: "evt-chatgpt",
@@ -1000,7 +1033,7 @@ mod tests {
             diagnostics: vec!["ignored malformed telemetry line 3".into()],
             opencode_usage: Ok(crate::opencode_history::OpenCodeUsageBundle {
                 history: primary_history,
-                agent_usage: vec![usage("opencode-db-messages-31d")],
+                agent_usage: vec![usage("opencode-db-messages-90d")],
                 diagnostics: vec![
                     "Skipped 1 OpenCode assistant metadata row with an invalid timestamp.".into(),
                 ],
@@ -1054,7 +1087,7 @@ mod tests {
         );
         assert!(
             snapshot.usage_history.rows.iter().any(|row| {
-                row.provider == "chatgpt-codex" && row.source == "vibebar-events-31d"
+                row.provider == "chatgpt-codex" && row.source == "vibebar-events-90d"
             })
         );
     }
@@ -1090,7 +1123,7 @@ mod tests {
                     agent: "executor",
                     provider: "custom-provider",
                     model: "glm5.2",
-                    source: "opencode-db-messages-31d",
+                    source: "opencode-db-messages-90d",
                     source_fidelity: "metadata",
                     input_tokens: 120,
                     output_tokens: 30,
@@ -1101,7 +1134,7 @@ mod tests {
                     agent: "reviewer",
                     provider: "custom-provider",
                     model: "glm5.2",
-                    source: "opencode-db-messages-31d",
+                    source: "opencode-db-messages-90d",
                     source_fidelity: "metadata",
                     input_tokens: 25,
                     output_tokens: 5,
@@ -1112,7 +1145,7 @@ mod tests {
                     agent: "executor",
                     provider: "nan",
                     model: "qwen3.6",
-                    source: "opencode-db-messages-31d",
+                    source: "opencode-db-messages-90d",
                     source_fidelity: "metadata",
                     input_tokens: 900,
                     output_tokens: 90,
@@ -1126,7 +1159,6 @@ mod tests {
 
         let snapshot = build_snapshot_from_sources(SnapshotBuildInputs {
             now,
-            telemetry_path: "/tmp/events-v1.jsonl".into(),
             providers,
             events: Vec::new(),
             diagnostics: Vec::new(),
@@ -1144,7 +1176,7 @@ mod tests {
             .find(|provider| provider.id == "custom-provider")
             .expect("history-only provider card should be synthesized");
         assert_eq!(custom.label, "Custom Provider");
-        assert_eq!(custom.source, "usage-history-31d");
+        assert_eq!(custom.source, "usage-history-90d");
         assert_eq!(custom.status, "ok");
         assert_eq!(custom.calls, 0);
         assert_eq!(custom.tokens.input_tokens, 145);
@@ -1176,19 +1208,43 @@ mod tests {
     }
 
     #[test]
-    fn history_only_provider_models_rank_by_observed_total_instead_of_primary() {
+    fn history_only_provider_models_rank_by_primary_with_observed_total_tiebreak() {
+        let mut primary_tie_cache = history_row(HistoryRowSpec {
+            day: "2026-08-16",
+            repository: "github.com/example/cache-tie",
+            agent: "executor",
+            provider: "custom-provider",
+            model: "primary-tie-cache",
+            source: "opencode-db-messages-90d",
+            source_fidelity: "metadata",
+            input_tokens: 80,
+            output_tokens: 20,
+        });
+        primary_tie_cache.tokens.cache_read_tokens = 50;
         let mut cache_heavy = history_row(HistoryRowSpec {
             day: "2026-08-16",
             repository: "github.com/example/cache",
             agent: "executor",
             provider: "custom-provider",
             model: "cache-heavy",
-            source: "opencode-db-messages-31d",
+            source: "opencode-db-messages-90d",
             source_fidelity: "metadata",
             input_tokens: 1,
             output_tokens: 0,
         });
         cache_heavy.tokens.cache_read_tokens = 500;
+        let mut reasoning_heavy = history_row(HistoryRowSpec {
+            day: "2026-08-16",
+            repository: "github.com/example/reasoning",
+            agent: "executor",
+            provider: "custom-provider",
+            model: "reasoning-heavy",
+            source: "opencode-db-messages-90d",
+            source_fidelity: "metadata",
+            input_tokens: 2,
+            output_tokens: 0,
+        });
+        reasoning_heavy.tokens.reasoning_tokens = 700;
         let history = UsageHistory {
             available: true,
             rows: vec![
@@ -1198,12 +1254,14 @@ mod tests {
                     agent: "executor",
                     provider: "custom-provider",
                     model: "primary-heavy",
-                    source: "opencode-db-messages-31d",
+                    source: "opencode-db-messages-90d",
                     source_fidelity: "metadata",
                     input_tokens: 100,
                     output_tokens: 0,
                 }),
+                primary_tie_cache,
                 cache_heavy,
+                reasoning_heavy,
             ],
             oldest_day: Some("2026-08-16".into()),
             newest_day: Some("2026-08-16".into()),
@@ -1214,9 +1272,23 @@ mod tests {
         let providers = reconcile_provider_cards_with_history(Vec::new(), &history, Utc::now());
 
         assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].models[0].model, "cache-heavy");
-        assert_eq!(providers[0].models[0].tokens.primary(), 1);
-        assert_eq!(providers[0].models[0].tokens.observed_total(), 501);
+        assert_eq!(
+            providers[0]
+                .models
+                .iter()
+                .map(|model| model.model.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "primary-tie-cache",
+                "primary-heavy",
+                "reasoning-heavy",
+                "cache-heavy"
+            ]
+        );
+        assert_eq!(providers[0].models[0].tokens.primary(), 100);
+        assert_eq!(providers[0].models[0].tokens.observed_total(), 150);
+        assert_eq!(providers[0].models[1].tokens.primary(), 100);
+        assert_eq!(providers[0].models[1].tokens.observed_total(), 100);
     }
 
     #[test]
@@ -1271,7 +1343,7 @@ mod tests {
                     agent: "esdata-executor",
                     provider: "nan",
                     model: "deepseek-v4-flash",
-                    source: "opencode-db-messages-31d",
+                    source: "opencode-db-messages-90d",
                     source_fidelity: "metadata",
                     input_tokens: 120,
                     output_tokens: 30,
@@ -1287,7 +1359,6 @@ mod tests {
 
         let snapshot = build_snapshot_from_sources(SnapshotBuildInputs {
             now,
-            telemetry_path: "/tmp/events-v1.jsonl".into(),
             providers,
             events: Vec::new(),
             diagnostics: Vec::new(),
@@ -1336,7 +1407,7 @@ mod tests {
                 agent: "executor",
                 provider: "nan",
                 model: "deepseek-v4-flash",
-                source: "opencode-db-messages-31d",
+                source: "opencode-db-messages-90d",
                 source_fidelity: "metadata",
                 input_tokens: 10,
                 output_tokens: 2,
@@ -1349,7 +1420,6 @@ mod tests {
 
         let snapshot = build_snapshot_from_sources(SnapshotBuildInputs {
             now,
-            telemetry_path: "/tmp/events-v1.jsonl".into(),
             providers: Vec::new(),
             events: Vec::new(),
             diagnostics: Vec::new(),
@@ -1375,7 +1445,6 @@ mod tests {
         let since = Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
         let snapshot = build_snapshot_from_sources(SnapshotBuildInputs {
             now,
-            telemetry_path: "/tmp/events-v1.jsonl".into(),
             providers: Vec::new(),
             events: Vec::new(),
             diagnostics: Vec::new(),
