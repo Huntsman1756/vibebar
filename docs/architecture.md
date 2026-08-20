@@ -26,4 +26,8 @@ Within `usageHistory`, the token contract stays exact and keeps each source coun
 
 Published allowances are reference metadata only. A percentage requires an authoritative provider meter for the same window to supply both usage and limit. Local counters never serve as a guessed quota numerator, so NaN allowance windows retain null `usedPercent` and `remainingPercent` until that provider meter exists.
 
+The frontend derives provider-neutral efficiency signals from the bounded history rows. It keeps cache reuse (`cacheRead / (cacheRead + input)`), uncached input share (`input / primary`), reasoning share, and average primary traffic per assistant message separate. The diagnostic baseline is the median of daily ratios across metadata-backed rows in the available 30-day local series. A missing denominator, metadata source, or baseline produces `Insufficient data`; no missing value becomes zero.
+
+The optional model price table is a frontend-only local-storage setting. It is keyed by normalized provider/model identity so `nan` and `opencode-go` remain separate. Source-reported row costs override local rates; a complete local rate is required before an unreported row participates in an `Estimated cost` total. No price configuration is included in `DashboardSnapshot`, telemetry, fixtures, or the public repository.
+
 `usageHistory` is part of that bounded snapshot contract. VibeBar serializes at most `1,000` aggregated history rows per snapshot; if more rows exist after aggregation, the snapshot keeps the highest-ranked `1,000` rows and sets `truncated = true` instead of returning an unmarked partial series.

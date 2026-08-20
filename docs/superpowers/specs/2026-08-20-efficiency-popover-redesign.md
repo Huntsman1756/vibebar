@@ -1,7 +1,7 @@
 # Efficiency Popover and Usage Diagnosis
 
 **Date:** 2026-08-20  
-**Status:** Draft for review  
+**Status:** Approved
 **Scope:** local macOS popover, full dashboard, and provider-neutral efficiency metrics
 
 ## Goal

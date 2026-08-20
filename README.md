@@ -73,6 +73,25 @@ Published allowances are reference metadata only. A percentage is available only
 
 Provider-supplied percentage windows, such as the Codex App Server rate-limit windows, remain available because their usage and limit come from the same authoritative source.
 
+## Efficiency diagnostics
+
+VibeBar adds a conservative diagnostic for the selected period. It compares the selected local history with the median of daily values in the available 30-day message-metadata series:
+
+- `Cache reuse`: `cacheReadTokens / (cacheReadTokens + inputTokens)`. Cache writes remain visible but never improve this ratio.
+- `Uncached input`: `inputTokens / (inputTokens + outputTokens)`. This is a context/input signal, not a quality judgement.
+- `Reasoning share`: the source-provided reasoning counter divided by primary traffic. Reasoning is never labelled waste.
+- `Primary / message`: primary traffic divided by the assistant-message count when that count is available.
+
+The dashboard reports `Good signal` when the selected period is at or better than that local baseline, `Watch` when either ratio is materially worse, and `Insufficient data` when the denominator, message metadata, or baseline is missing. These labels are workload hints, not provider benchmarks, billing meters, or guarantees about output quality.
+
+The `Where it went` views rank provider/model, agent, and repository contributors by **primary traffic**. Observed traffic remains visible separately so cache and reasoning counters cannot make a row look like an invoice. Source fidelity is shown beside the result; assistant-message metadata is stronger than session or event fallback data.
+
+## Optional local price estimates
+
+When a provider does not report a charge, the full dashboard can store a model price table locally in the browser storage of this Mac. Rates are entered as USD per one million input, output, reasoning, cache-read, and cache-write tokens. A row is used only after all five rates are entered, and the result is labelled `Estimated cost`.
+
+Provider-reported costs always win. If a selected row has neither a reported cost nor a complete local rate, VibeBar shows `Cost unavailable` instead of displaying a partial estimate. The price table is never sent to Rust, GitHub, NaN, OpenCode, or a remote service, and it is not part of the public repository.
+
 ## Provider and repository semantics
 
 Provider IDs stay distinct. `nan` renders as `NaN`, `opencode-go` renders as `OpenCode Go`, and unknown provider IDs remain visible rather than being collapsed into a different provider.
